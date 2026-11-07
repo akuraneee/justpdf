@@ -23,7 +23,7 @@ examples/headless.rs  renders the real app offscreen via Mesa EGL and writes PNG
 tests/pdf.rs        PDFium integration tests (need PDFIUM_PATH + JUSTPDF_TEST_PDF)
 scripts/            fetch-pdfium.sh, make-test-pdf.py, package-apk.py
 build.sh            Gradle-free APK build
-.github/workflows/build.yml  CI: clippy + tests, APKs as artifacts, release on v* tags
+.github/workflows/build.yml  CI: fmt + clippy + tests, APKs; every green build of main → GitHub release `build-N` (v* tags → that version)
 ```
 
 ## Architecture

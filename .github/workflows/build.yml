@@ -48,12 +48,27 @@ jobs:
   apk:
     name: APK
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # version code = commit count
+      - name: Version
+        id: version
+        run: |
+          base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            tag="$GITHUB_REF_NAME"
+          else
+            version="$base-build.$GITHUB_RUN_NUMBER"
+            tag="build-$GITHUB_RUN_NUMBER"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "VERSION_NAME=$version" >> "$GITHUB_ENV"
       - uses: actions/setup-java@v6
         with:
           distribution: temurin
@@ -94,9 +109,41 @@ jobs:
           name: justpdf-apks
           path: build/out/*.apk
           if-no-files-found: error
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v3
+
+  # Every green build of main becomes a GitHub release (tag build-N);
+  # pushing a v* tag publishes that version instead.
+  release:
+    name: Release
+    needs: [test, apk]
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
         with:
-          files: build/out/*.apk
+          name: justpdf-apks
+          path: apks
+      - name: Release notes
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          {
+            echo "Automatic build of \`${GITHUB_SHA::7}\`${COMMIT_MESSAGE:+: ${COMMIT_MESSAGE%%$'\n'*}}"
+            echo
+            echo "**Which APK to install?**"
+            echo "- \`justpdf-arm64-v8a.apk\`: almost every phone from the last ~8 years"
+            echo "- \`justpdf-armeabi-v7a.apk\`: old 32-bit phones"
+            echo "- \`justpdf-x86_64.apk\`: emulators and Chromebooks"
+            echo "- \`justpdf-universal.apk\`: all of the above in one (bigger) file"
+          } > notes.md
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.apk.outputs.tag }}
+          name: JustPDF ${{ needs.apk.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body_path: notes.md
           generate_release_notes: true
+          make_latest: true
+          files: apks/*.apk
+          fail_on_unmatched_files: true
