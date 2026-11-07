@@ -1,0 +1,32 @@
+[package]
+name = "justpdf"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal, fast PDF reader for Android (webtoon-style vertical scrolling)"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Build the GLES/EGL backend on a desktop Linux host (used by examples/headless.rs).
+headless = []
+
+[dependencies]
+ab_glyph = "0.2"
+libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[[example]]
+name = "headless"
+required-features = ["headless"]
