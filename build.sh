@@ -20,8 +20,8 @@ ROOT=$PWD
 ABIS=${ABIS:-"arm64-v8a armeabi-v7a x86_64"}
 PROFILE=${PROFILE:-release}
 MIN_SDK=26
-TARGET_SDK=35
-BUILD_TOOLS=${BUILD_TOOLS:-35.0.0}
+TARGET_SDK=36
+BUILD_TOOLS=${BUILD_TOOLS:-36.0.0}
 VERSION_NAME=${VERSION_NAME:-$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)}
 VERSION_CODE=${VERSION_CODE:-$(git rev-list --count HEAD 2>/dev/null || echo 1)}
 

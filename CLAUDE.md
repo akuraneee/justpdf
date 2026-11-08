@@ -48,7 +48,7 @@ Java ↔ Rust contract (names must match exactly; d8 only, no R8 so nothing is r
 
 ## Building
 
-Toolchain: Rust stable with Android targets, Android SDK (build-tools 35, platform 35), NDK r28, JDK 17+, python3.
+Toolchain: Rust stable with Android targets, Android SDK (build-tools 36, platform 36), NDK r28, JDK 17+, python3.
 
 ```
 ANDROID_HOME=... ./build.sh                    # all ABIs → build/out/justpdf-{arm64-v8a,armeabi-v7a,x86_64,universal}.apk

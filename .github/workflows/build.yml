@@ -16,7 +16,7 @@ concurrency:
 
 env:
   NDK_VERSION: 28.2.13676358
-  BUILD_TOOLS: 35.0.0
+  BUILD_TOOLS: 36.0.0
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -85,7 +85,7 @@ jobs:
         run: |
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           (yes || true) | "$sdkmanager" --licenses > /dev/null || true
-          "$sdkmanager" "build-tools;$BUILD_TOOLS" "platforms;android-35" "ndk;$NDK_VERSION" > /dev/null
+          "$sdkmanager" "build-tools;$BUILD_TOOLS" "platforms;android-36" "ndk;$NDK_VERSION" > /dev/null
       - name: Signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}

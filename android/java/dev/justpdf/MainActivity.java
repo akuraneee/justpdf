@@ -18,6 +18,7 @@ import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.window.OnBackInvokedDispatcher;
 
 /**
  * Thin platform shim. Everything (rendering, input handling, UI, PDF) lives in
@@ -94,6 +95,12 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
             sendInsets(insets);
             return insets;
         });
+
+        if (Build.VERSION.SDK_INT >= 33) {
+            // targetSdk 36: onBackPressed() is no longer dispatched on Android 16+.
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                    OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::onBackPressed);
+        }
 
         handle = nativeCreate(this, getFilesDir().getAbsolutePath(), getResources().getDisplayMetrics().density);
 
