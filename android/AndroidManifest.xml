@@ -19,7 +19,20 @@
             android:launchMode="singleTask"
             android:screenOrientation="unspecified"
             android:windowSoftInputMode="adjustNothing|stateHidden"
+            android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|locale|colorMode|touchscreen">
+
+            <!-- Freeform / floating windows: no aspect constraint, only small minimums,
+                 so the window can be resized to any shape (portrait or landscape). -->
+            <layout
+                android:gravity="center"
+                android:minWidth="200dp"
+                android:minHeight="200dp" />
+
+            <!-- Allow size changes without the compat "size-compat" letterboxing. -->
+            <meta-data
+                android:name="android.supports_size_changes"
+                android:value="true" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
