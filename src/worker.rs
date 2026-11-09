@@ -5,7 +5,7 @@
 //! requests for tiles that scrolled away simply disappear.
 
 use std::collections::{HashMap, VecDeque};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
@@ -43,11 +43,11 @@ pub enum Msg {
         doc: u64,
         items: Vec<OutlineItem>,
     },
+    /// A rendered tile; `req` is the request it answers (its geometry tells
+    /// the app whether the tile still fits the current layout).
     Tile {
         doc: u64,
-        key: TileKey,
-        w: u32,
-        h: u32,
+        req: RenderReq,
         pixels: Vec<u8>,
     },
     /// Matches on one page; each match is a list of page-fraction rects.
@@ -117,10 +117,9 @@ impl Worker {
         r
     }
 
-    /// Opens a new document from `fd` (ownership is taken). The current
-    /// document stays usable until the new one opens successfully.
-    pub fn open(&self, doc: u64, fd: i32) {
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    /// Opens a new document from `fd`. The current document stays usable
+    /// until the app sends its first request for the new one.
+    pub fn open(&self, doc: u64, fd: OwnedFd) {
         self.with(|q| q.ctrl.push_back(Ctrl::Open { doc, fd }));
     }
 
@@ -219,20 +218,44 @@ fn next_job(shared: &Shared) -> Option<Job> {
     }
 }
 
+/// An open document and the descriptor it reads from (dropped in that order).
+struct Loaded {
+    id: u64,
+    doc: Document,
+    _fd: OwnedFd,
+}
+
 struct State {
     sink: Sink,
-    /// The document currently shown.
-    cur: Option<(u64, Document, OwnedFd)>,
+    /// The document the app shows: the target of its requests.
+    cur: Option<Loaded>,
+    /// The most recently opened document, not requested by the app yet. It
+    /// replaces `cur` on its first request; until then `cur` stays usable, so
+    /// the app can keep its document if it abandons this one (e.g. another
+    /// file was picked meanwhile and failed to open).
+    fresh: Option<Loaded>,
     /// A document waiting for a password.
     pending: Option<(u64, OwnedFd)>,
+    /// Folded text per page of `cur`.
     texts: HashMap<u32, PageText>,
+}
+
+impl State {
+    /// The document `id`, if open; promotes `fresh` to current on first use.
+    fn doc(&mut self, id: u64) -> Option<&mut Document> {
+        if self.fresh.as_ref().is_some_and(|f| f.id == id) {
+            self.cur = self.fresh.take();
+            self.texts.clear();
+        }
+        self.cur.as_mut().filter(|c| c.id == id).map(|c| &mut c.doc)
+    }
 }
 
 fn run(shared: Arc<Shared>, sink: Sink) {
     if let Err(e) = pdfium::init() {
         crate::log_e!("pdfium init failed: {e}");
     }
-    let mut st = State { sink, cur: None, pending: None, texts: HashMap::new() };
+    let mut st = State { sink, cur: None, fresh: None, pending: None, texts: HashMap::new() };
     while let Some(job) = next_job(&shared) {
         let _guard = pdfium::LOCK.lock().unwrap_or_else(|e| e.into_inner());
         match job {
@@ -249,18 +272,17 @@ fn run(shared: Arc<Shared>, sink: Sink) {
             }
             Job::Ctrl(Ctrl::Close) => {
                 st.cur = None;
+                st.fresh = None;
                 st.pending = None;
                 st.texts.clear();
             }
             Job::Render(doc, req, mut buf) => {
-                let ok = match st.cur.as_mut() {
-                    Some((id, d, _)) if *id == doc => {
-                        d.render(req.key.page as usize, req.page_w, req.page_h, req.x, req.y, req.w, req.h, &mut buf)
-                    }
-                    _ => false,
+                let ok = match st.doc(doc) {
+                    Some(d) => d.render(req.key.page as usize, req.page_w, req.page_h, req.x, req.y, req.w, req.h, &mut buf),
+                    None => false,
                 };
                 if ok {
-                    (st.sink)(Msg::Tile { doc, key: req.key, w: req.w, h: req.h, pixels: buf });
+                    (st.sink)(Msg::Tile { doc, req, pixels: buf });
                 } else {
                     let mut q = shared.q.lock().unwrap_or_else(|e| e.into_inner());
                     q.pool.push(buf);
@@ -275,7 +297,7 @@ fn run(shared: Arc<Shared>, sink: Sink) {
         }
     }
     let _guard = pdfium::LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    st.cur = None;
+    drop(st);
 }
 
 fn try_open(st: &mut State, doc: u64, fd: OwnedFd, password: Option<&str>) {
@@ -284,8 +306,7 @@ fn try_open(st: &mut State, doc: u64, fd: OwnedFd, password: Option<&str>) {
             let sizes = d.sizes().to_vec();
             (st.sink)(Msg::Opened { doc, sizes });
             let items = d.outline();
-            st.texts.clear();
-            st.cur = Some((doc, d, fd));
+            st.fresh = Some(Loaded { id: doc, doc: d, _fd: fd });
             (st.sink)(Msg::Outline { doc, items });
         }
         Err(OpenError::Password) => {
@@ -300,11 +321,11 @@ fn try_open(st: &mut State, doc: u64, fd: OwnedFd, password: Option<&str>) {
 }
 
 fn search_page(st: &mut State, doc: u64, gen: u64, query: &[char], page: u32) {
-    let Some((id, d, _)) = st.cur.as_mut() else { return };
-    if *id != doc {
+    if st.doc(doc).is_none() {
         return;
     }
-    let cached = st.texts.get(&page);
+    let State { cur: Some(Loaded { doc: d, .. }), texts, sink, .. } = st else { return };
+    let cached = texts.get(&page);
     let hits = match cached {
         Some(text) => {
             let ranges = search::find(text, query);
@@ -322,7 +343,7 @@ fn search_page(st: &mut State, doc: u64, gen: u64, query: &[char], page: u32) {
             });
             match res {
                 Some((text, rects)) => {
-                    st.texts.insert(page, text);
+                    texts.insert(page, text);
                     Some(rects)
                 }
                 None => None,
@@ -332,7 +353,7 @@ fn search_page(st: &mut State, doc: u64, gen: u64, query: &[char], page: u32) {
     if let Some(hits) = hits {
         let hits: Vec<_> = hits.into_iter().filter(|r| !r.is_empty()).collect();
         if !hits.is_empty() {
-            (st.sink)(Msg::SearchHits { doc, gen, page, hits });
+            sink(Msg::SearchHits { doc, gen, page, hits });
         }
     }
 }

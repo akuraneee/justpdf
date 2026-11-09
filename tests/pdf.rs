@@ -3,6 +3,7 @@
 //!   JUSTPDF_TEST_PDF  a PDF made by scripts/make-test-pdf.py
 //! and are skipped when either is missing.
 
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -70,7 +71,7 @@ fn worker_round_trip() {
     let worker = Worker::new(Box::new(move |m| {
         let _ = tx.lock().unwrap().send(m);
     }));
-    worker.open(7, open_fd(&path));
+    worker.open(7, unsafe { OwnedFd::from_raw_fd(open_fd(&path)) });
     let next = || rx.recv_timeout(Duration::from_secs(10)).expect("worker reply");
     match next() {
         Msg::Opened { doc, sizes } => assert_eq!((doc, sizes.len()), (7, 60)),
@@ -79,15 +80,30 @@ fn worker_round_trip() {
     assert!(matches!(next(), Msg::Outline { doc: 7, .. }));
 
     let key = TileKey { page: 2, level: 0, row: 0, col: 0 };
-    worker.set_queue(7, vec![RenderReq { key, page_w: 540, page_h: 764, x: 0, y: 0, w: 540, h: 512, urgent: true }]);
+    let req = RenderReq { key, page_w: 540, page_h: 764, x: 0, y: 0, w: 540, h: 512, urgent: true };
+    worker.set_queue(7, vec![req.clone()]);
     match next() {
-        Msg::Tile { doc, key: k, w, h, pixels } => {
-            assert_eq!((doc, k, w, h, pixels.len()), (7, key, 540, 512, 540 * 512 * 4));
+        Msg::Tile { doc, req: r, pixels } => {
+            assert_eq!((doc, pixels.len()), (7, 540 * 512 * 4));
+            assert_eq!(r, req);
         }
         m => panic!("unexpected {m:?}"),
     }
 
-    worker.search(7, 1, search::fold_query("needle"), 0, 60);
+    // A second document that the app never uses must not replace the first:
+    // the worker keeps serving document 7 until a request for 8 arrives.
+    worker.open(8, unsafe { OwnedFd::from_raw_fd(open_fd(&path)) });
+    assert!(matches!(next(), Msg::Opened { doc: 8, .. }));
+    assert!(matches!(next(), Msg::Outline { doc: 8, .. }));
+    let req = RenderReq { key: TileKey { page: 3, ..key }, ..req };
+    worker.set_queue(7, vec![req.clone()]);
+    assert!(matches!(next(), Msg::Tile { doc: 7, .. }), "document 7 still renders");
+    worker.set_queue(8, vec![req.clone()]);
+    assert!(matches!(next(), Msg::Tile { doc: 8, .. }));
+    worker.set_queue(7, vec![req]);
+    assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "document 7 is closed once 8 was used");
+
+    worker.search(8, 1, search::fold_query("needle"), 0, 60);
     let mut hits = 0;
     loop {
         match next() {

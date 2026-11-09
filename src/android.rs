@@ -5,6 +5,7 @@
 //! state and (through the app) the PDF worker.
 
 use std::ffi::c_void;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex, Once, OnceLock};
@@ -216,6 +217,10 @@ fn run(vm: JavaVM, activity: GlobalRef, rx: Receiver<Cmd>, tx: Sender<Cmd>, shar
                         g.egl.detach_window();
                     }
                     window = None;
+                    if gfx.is_none() {
+                        // Setting up GL failed before (or after a lost context): try again.
+                        gfx = create_gfx();
+                    }
                     if let Some(g) = gfx.as_mut() {
                         // SAFETY: `w` owns a reference to the window until it is dropped,
                         // and it is detached before that happens.
@@ -430,15 +435,16 @@ pub extern "system" fn Java_dev_justpdf_MainActivity_nativeOpen<'l>(
     uri: JString<'l>,
     name: JString<'l>,
 ) {
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: Java detached the descriptor and hands its ownership over; it is
+    // closed when dropped, whatever happens to the event.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let uri = jstr(&mut env, &uri);
     let name = jstr(&mut env, &name);
-    match handle(h) {
-        Some(handle) => {
-            let _ = handle.tx.send(Cmd::App(Event::Open { fd, uri, name }));
-        }
-        None => unsafe {
-            libc::close(fd);
-        },
+    if let Some(handle) = handle(h) {
+        let _ = handle.tx.send(Cmd::App(Event::Open { fd, uri, name }));
     }
 }
 

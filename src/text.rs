@@ -51,18 +51,28 @@ fn map_file(path: &str) -> Option<&'static [u8]> {
     }
 }
 
-fn load_face(path: &str) -> Option<FontRef<'static>> {
+/// Maps and parses a font, keeping it only if `usable` accepts it (the mapping
+/// of a rejected file is released).
+fn load_face_if(path: &str, usable: impl Fn(&FontRef) -> bool) -> Option<FontRef<'static>> {
     let data = map_file(path)?;
-    FontRef::try_from_slice_and_index(data, 0).ok()
+    let face = FontRef::try_from_slice_and_index(data, 0).ok().filter(|f| usable(f));
+    if face.is_none() {
+        unsafe { libc::munmap(data.as_ptr() as *mut libc::c_void, data.len()) };
+    }
+    face
+}
+
+fn load_face(path: &str) -> Option<FontRef<'static>> {
+    load_face_if(path, |_| true)
 }
 
 fn scan_for_face(dir: &str) -> Option<FontRef<'static>> {
     let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).collect();
     entries.sort();
-    entries.into_iter().filter(|p| p.extension().is_some_and(|e| e == "ttf")).find_map(|p| {
-        let f = load_face(p.to_str()?)?;
-        (f.glyph_id('a').0 != 0 && f.glyph_id('0').0 != 0).then_some(f)
-    })
+    entries
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "ttf"))
+        .find_map(|p| load_face_if(p.to_str()?, |f| f.glyph_id('a').0 != 0 && f.glyph_id('0').0 != 0))
 }
 
 #[derive(Clone, Copy, Debug)]

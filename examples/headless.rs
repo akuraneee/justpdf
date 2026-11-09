@@ -6,9 +6,11 @@
 //!
 //! Window size: JUSTPDF_HEADLESS_SIZE=WxH (default 1080x2340, density 2.75).
 //! Commands: shot:NAME, wait:MS, drag:DY, dragx:DX, fling:DY, tap:X,Y, dtap:X,Y,
-//! swipe:X,Y,DX,DY, pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle
+//! swipe:X,Y,DX,DY, pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle,
+//! resize:W,H (a new window size, e.g. a rotation)
 
 use std::io::Write;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -59,6 +61,8 @@ struct Harness {
     mock: Mock,
     start: Instant,
     touch_t: f64,
+    /// Current window size.
+    size: (u32, u32),
 }
 
 impl Harness {
@@ -137,7 +141,7 @@ impl Harness {
             eprintln!("GL error before={before:#x} after={err:#x}");
         }
         let px = self.gpu.read_pixels();
-        let (w, h) = size();
+        let (w, h) = self.size;
         write_png(path, w, h, &px).expect("write png");
         println!("wrote {path}");
     }
@@ -154,7 +158,9 @@ fn main() {
 
     let (w, h) = size();
     let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
-    let _egl = Egl::new(w as i32, h as i32).expect("EGL");
+    // Square, so `resize` can turn the window either way.
+    let side = w.max(h) as i32;
+    let _egl = Egl::new(side, side).expect("EGL");
     let gpu = GlGpu::new().expect("GL");
     let (tx, rx) = mpsc::channel();
     let sink_tx = std::sync::Mutex::new(tx.clone());
@@ -165,7 +171,7 @@ fn main() {
     std::fs::create_dir_all(&files).unwrap();
     let mut app = App::new(DENSITY, Some(files), sink);
     app.resize(w, h);
-    let mut h = Harness { app, gpu, rx, mock: Mock::default(), start: Instant::now(), touch_t: 100.0 };
+    let mut h = Harness { app, gpu, rx, mock: Mock::default(), start: Instant::now(), touch_t: 100.0, size: (w, h) };
     let t = h.now();
     h.app.handle(Event::Insets([0.0, 66.0, 0.0, 44.0]), t, &mut h.mock);
 
@@ -174,6 +180,7 @@ fn main() {
     assert!(fd >= 0, "cannot open {pdf}");
     let name = std::path::Path::new(pdf).file_name().unwrap().to_string_lossy().into_owned();
     let t = h.now();
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     h.app.handle(Event::Open { fd, uri: format!("file://{pdf}"), name }, t, &mut h.mock);
     let t0 = Instant::now();
     while !h.app.has_document() && t0.elapsed() < Duration::from_secs(10) {
@@ -200,12 +207,13 @@ fn main() {
             "swipe" => h.drag(nums[0], nums[1], nums[2], nums[3], 20, 16),
             "tap" => {
                 h.tap(nums[0], nums[1]);
-                h.run_for(350);
+                // Past the single-tap delay and the overlay fade.
+                h.run_for(500);
             }
             "dtap" => {
                 h.tap(nums[0], nums[1]);
                 h.tap(nums[0], nums[1]);
-                h.run_for(350);
+                h.run_for(500);
             }
             "pinch" => {
                 let (cx, cy, f) = (nums[0], nums[1], nums[2]);
@@ -237,8 +245,14 @@ fn main() {
                 let t = h.now();
                 h.app.handle(Event::Key(nums[0] as i32), t, &mut h.mock);
             }
+            "resize" => {
+                h.size = (nums[0] as u32, nums[1] as u32);
+                h.app.resize(h.size.0, h.size.1);
+            }
             _ => eprintln!("unknown command {cmd}"),
         }
+        // Like the device loop: a frame follows every event (buttons move with the mode).
+        h.pump();
         let rss =
             std::fs::read_to_string("/proc/self/statm").ok().and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok()).unwrap_or(0)
                 * 4

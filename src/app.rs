@@ -2,6 +2,7 @@
 //! Platform independent; the Android glue feeds it events and a GL backend.
 
 use std::collections::{HashSet, VecDeque};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 use crate::gesture::{Fling, VelocityTracker};
@@ -56,7 +57,7 @@ pub enum Event {
     Key(i32),
     Back,
     Open {
-        fd: i32,
+        fd: OwnedFd,
         uri: String,
         name: String,
     },
@@ -169,6 +170,8 @@ struct Pending {
     uri: String,
     name: String,
     since: f64,
+    /// The worker asked for a password (the password prompt belongs to this file).
+    needs_password: bool,
 }
 
 struct Match {
@@ -203,9 +206,7 @@ struct Panel {
 
 struct Upload {
     doc: u64,
-    key: TileKey,
-    w: u32,
-    h: u32,
+    req: RenderReq,
     pixels: Vec<u8>,
 }
 
@@ -274,8 +275,11 @@ pub struct App {
     dirty: bool,
 }
 
-const TAP_TIMEOUT: f64 = 0.25;
 const DOUBLE_TAP_GAP: f64 = 0.3;
+/// A tap counts as a single tap once a second one can no longer make it a double tap.
+const TAP_TIMEOUT: f64 = DOUBLE_TAP_GAP;
+/// The "Opening …" message appears if a document takes longer than this.
+const OPENING_DELAY: f64 = 0.3;
 const OVERLAY_TIMEOUT: f64 = 4.0;
 
 fn ease_out(u: f64) -> f64 {
@@ -433,7 +437,17 @@ impl App {
         if let Some(d) = self.search.debounce {
             add(d);
         }
+        if let Some(at) = self.opening_message_at() {
+            if at > self.now {
+                add(at);
+            }
+        }
         t
+    }
+
+    /// When the "Opening …" message should appear (no document shown yet).
+    fn opening_message_at(&self) -> Option<f64> {
+        self.pending.as_ref().filter(|_| self.doc.is_none()).map(|pd| pd.since + OPENING_DELAY)
     }
 
     // ----- geometry ---------------------------------------------------------------------
@@ -723,10 +737,12 @@ impl App {
                 let id = self.next_id;
                 self.next_id += 1;
                 self.worker.open(id, fd);
+                // Replaces any file still opening or waiting for a password; set
+                // first so leaving the password prompt does not reopen the picker.
+                self.pending = Some(Pending { id, uri, name, since: now, needs_password: false });
                 if self.mode == Mode::Password {
                     self.set_mode(Mode::Read, p);
                 }
-                self.pending = Some(Pending { id, uri, name, since: now });
             }
             Event::OpenFailed(msg) => {
                 crate::log_w!("open failed: {msg}");
@@ -776,10 +792,14 @@ impl App {
                 self.touch_activity();
             }
             Msg::NeedPassword { doc, wrong } => {
-                if self.pending.as_ref().is_some_and(|pd| pd.id == doc) {
+                if let Some(pd) = self.pending.as_mut().filter(|pd| pd.id == doc) {
+                    pd.needs_password = true;
+                    // Through set_mode so a running search is stopped and the panel closed.
+                    if self.mode != Mode::Password {
+                        self.set_mode(Mode::Password, p);
+                    }
                     self.field.clear();
                     self.cursor = 0;
-                    self.mode = Mode::Password;
                     p.show_keyboard(KB_PASSWORD, "");
                     self.keyboard = true;
                     if wrong {
@@ -802,9 +822,9 @@ impl App {
                     self.update_dock(self.vh);
                 }
             }
-            Msg::Tile { doc, key, w, h, pixels } => {
-                if self.doc.as_ref().is_some_and(|d| d.id == doc) && !self.tiles.contains(&key) && self.in_flight.insert(key) {
-                    self.uploads.push_back(Upload { doc, key, w, h, pixels });
+            Msg::Tile { doc, req, pixels } => {
+                if self.doc.as_ref().is_some_and(|d| d.id == doc) && !self.tiles.contains(&req.key) && self.in_flight.insert(req.key) {
+                    self.uploads.push_back(Upload { doc, req, pixels });
                 } else {
                     self.worker.recycle(pixels);
                 }
@@ -827,6 +847,9 @@ impl App {
     }
 
     fn key(&mut self, code: i32) {
+        if self.layout().is_none() {
+            return;
+        }
         let vh = self.vh as f64 / self.view.zoom;
         let vw = self.vw as f64 / self.view.zoom;
         let v = self.view;
@@ -867,7 +890,8 @@ impl App {
             let text = std::mem::take(&mut self.search.text);
             self.search = SearchState { gen, text, ..Default::default() };
         }
-        if old == Mode::Password && mode != Mode::Password {
+        if old == Mode::Password && mode != Mode::Password && self.pending.as_ref().is_some_and(|pd| pd.needs_password) {
+            // The password prompt was cancelled: give up on that file.
             self.pending = None;
             if self.doc.is_none() {
                 p.open_picker();
@@ -1089,7 +1113,17 @@ impl App {
         let stopped = self.fling.is_some() || self.anim.is_some();
         self.fling = None;
         self.anim = None;
+        if self.is_second_tap(time, x, y) {
+            // The first tap is not a single tap (and must not fire while this one is down).
+            self.tap_at = None;
+        }
         self.gesture = Gesture::Pending { x, y, t: time, stopped };
+    }
+
+    /// Whether a tap going down at `t` (event time) at (`x`, `y`) follows the
+    /// previous tap closely enough to make a double tap.
+    fn is_second_tap(&self, t: f64, x: f32, y: f32) -> bool {
+        self.last_tap.is_some_and(|(lt, lx, ly)| t - lt < DOUBLE_TAP_GAP && (x - lx).hypot(y - ly) < self.dp(40.0))
     }
 
     fn on_pointer_down(&mut self) {
@@ -1134,6 +1168,7 @@ impl App {
                         self.overlay = false;
                     }
                     self.tap_at = None;
+                    self.last_tap = None;
                     // Apply the movement past the slop immediately.
                     self.drag_by(cx - x, cy - y);
                 }
@@ -1206,8 +1241,7 @@ impl App {
                 if stopped {
                     return;
                 }
-                let dbl = self.last_tap.is_some_and(|(lt, lx, ly)| t - lt < DOUBLE_TAP_GAP && (x - lx).hypot(y - ly) < self.dp(40.0));
-                if dbl {
+                if self.is_second_tap(t, x, y) {
                     self.last_tap = None;
                     self.tap_at = None;
                     self.double_tap(x, y);
@@ -1410,12 +1444,17 @@ impl App {
 
     pub fn update(&mut self, now: f64, p: &mut dyn Platform) {
         let dt = (now - self.last_update).clamp(0.0, 0.1) as f32;
+        if self.opening_message_at().is_some_and(|at| self.last_update < at && now >= at) {
+            self.dirty = true;
+        }
         self.last_update = now;
         self.now = now;
 
         if let Some((at, x, y)) = self.tap_at {
             if now >= at {
                 self.tap_at = None;
+                // Too late for a double tap now.
+                self.last_tap = None;
                 self.single_tap(x, y, p);
             }
         }
@@ -1662,25 +1701,22 @@ impl App {
         let mut count = 0;
         let mut bytes = 0;
         while let Some(u) = self.uploads.pop_front() {
-            self.in_flight.remove(&u.key);
+            let key = u.req.key;
+            self.in_flight.remove(&key);
             let dims = match &self.doc {
-                Some(d) if d.id == u.doc && self.wanted.contains(&u.key) => d.layout.as_ref().and_then(|l| {
-                    let p = u.key.page as usize;
-                    if p >= l.len() {
-                        None
-                    } else if u.key.is_thumb() {
-                        Some((u.w, u.h))
-                    } else {
-                        let g = layout::grid(l, p, u.key.level);
-                        (u.w <= g.tile_w && u.h <= g.tile_h).then_some((g.tile_w, g.tile_h))
-                    }
-                }),
+                Some(d) if d.id == u.doc && self.wanted.contains(&key) => d.layout.as_ref().and_then(|l| texture_size(l, &u.req)),
                 _ => None,
             };
-            if let Some((tw, th)) = dims {
-                self.tiles.insert(gpu, u.key, u.w, u.h, tw, th, &u.pixels, self.frame);
-                count += 1;
-                bytes += u.pixels.len();
+            match dims {
+                Some((tw, th)) => {
+                    self.tiles.insert(gpu, key, u.req.w, u.req.h, tw, th, &u.pixels, self.frame);
+                    count += 1;
+                    bytes += u.pixels.len();
+                }
+                // Rendered for an outdated layout: it was left out of the last
+                // request plan while in flight, so plan it again.
+                None if self.wanted.contains(&key) => self.requests_dirty = true,
+                None => {}
             }
             self.worker.recycle(u.pixels);
             if count >= 4 || bytes >= 8 << 20 {
@@ -1756,6 +1792,11 @@ impl App {
         gpu.draw_ui(&over.v, atlas);
 
         self.tiles.evict(gpu, self.frame, &self.wanted);
+        // Clearing the cache or dropping outdated tiles changes what must be
+        // requested; do it now, as nothing else may wake the loop.
+        if self.requests_dirty {
+            self.update_requests();
+        }
     }
 
     fn tile_rect(&self, l: &Layout, k: &TileKey, pr: [f64; 4]) -> [f64; 4] {
@@ -1962,7 +2003,7 @@ impl App {
 
         if self.doc.is_none() {
             if let Some(pd) = &self.pending {
-                if self.now - pd.since > 0.3 {
+                if self.now >= pd.since + OPENING_DELAY {
                     let msg = format!("Opening {}…", pd.name);
                     let px = self.dp(15.0);
                     let w = self.text.measure(&msg, px).min(vw - self.dp(32.0));
@@ -1999,10 +2040,11 @@ impl App {
             p.rect(pw, 0.0, self.ox - pw, vh, [18, 18, 20, 255], 0.0);
             p.rect(pw - 1.0, 0.0, 1.0, vh, [255, 255, 255, 18], 0.0);
         }
-        let Some(d) = &self.doc else { return };
-        let items = d.outline.clone();
-        let n_pages = d.sizes.len();
         let current = self.current_chapter();
+        let Some(d) = self.doc.as_mut() else { return };
+        // Borrowed out for the loop (cloning it every frame would allocate per item); put back below.
+        let items = std::mem::take(&mut d.outline);
+        let n_pages = d.sizes.len();
         let top = self.panel_top();
         let row_h = self.row_h();
         let bottom = vh - self.insets[3];
@@ -2032,6 +2074,9 @@ impl App {
             let title = if it.title.is_empty() { "—" } else { it.title.as_str() };
             self.text.draw(p, title, tx, base + self.text.cap_height(tpx) / 2.0, tpx, color, (nx - self.dp(12.0) - tx).max(0.0));
         }
+        if let Some(d) = self.doc.as_mut() {
+            d.outline = items;
+        }
         // Header drawn last so rows scroll underneath it.
         p.rect(x0, 0.0, pw, top, ui::PANEL, 0.0);
         let hpx = self.dp(18.0);
@@ -2055,6 +2100,24 @@ impl App {
     }
 }
 
+/// Texture size for a rendered tile, or `None` if it was rendered for another
+/// layout (after a resize or a spread toggle the same key means another piece).
+fn texture_size(l: &Layout, r: &RenderReq) -> Option<(u32, u32)> {
+    let p = r.key.page as usize;
+    if p >= l.len() {
+        return None;
+    }
+    if r.key.is_thumb() {
+        // Stretched over the page whatever its resolution.
+        return Some((r.w, r.h));
+    }
+    let g = layout::grid(l, p, r.key.level);
+    let (col, row) = (r.key.col as u32, r.key.row as u32);
+    let fits =
+        (g.page_w, g.page_h) == (r.page_w, r.page_h) && col < g.cols && row < g.rows && g.tile_rect(col, row) == (r.x, r.y, r.w, r.h);
+    fits.then_some((g.tile_w, g.tile_h))
+}
+
 fn utf16_to_char_index(s: &str, utf16: usize) -> usize {
     let mut units = 0;
     for (i, c) in s.chars().enumerate() {
@@ -2064,4 +2127,206 @@ fn utf16_to_char_index(s: &str, utf16: usize) -> usize {
         units += c.len_utf16();
     }
     s.chars().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx::NullGpu;
+
+    #[derive(Default)]
+    struct Mock {
+        log: Vec<&'static str>,
+    }
+
+    impl Platform for Mock {
+        fn open_picker(&mut self) {
+            self.log.push("open_picker");
+        }
+        fn show_keyboard(&mut self, _: i32, _: &str) {
+            self.log.push("show_keyboard");
+        }
+        fn hide_keyboard(&mut self) {
+            self.log.push("hide_keyboard");
+        }
+        fn system_bars(&mut self, _: bool) {}
+        fn keep_screen_on(&mut self, _: bool) {}
+        fn exit(&mut self) {
+            self.log.push("exit");
+        }
+    }
+
+    const PAGE0: TileKey = TileKey { page: 0, level: 0, row: 0, col: 0 };
+
+    /// Starts opening a file; returns the document id the app expects.
+    fn open(app: &mut App, p: &mut Mock, now: f64) -> u64 {
+        let id = app.next_id;
+        let fd: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        app.handle(Event::Open { fd, uri: format!("test://{id}"), name: "t.pdf".into() }, now, p);
+        id
+    }
+
+    /// The worker opened document `id` (10 letter-size pages).
+    fn opened(app: &mut App, p: &mut Mock, id: u64, now: f64) {
+        app.handle(Event::Worker(Msg::Opened { doc: id, sizes: vec![(612.0, 792.0); 10] }), now, p);
+    }
+
+    /// An app in a `w` x 2340 window showing document 1.
+    fn app_with_doc(w: u32, p: &mut Mock) -> App {
+        let mut app = App::new(2.75, None, Box::new(|_: Msg| {}));
+        app.resize(w, 2340);
+        let id = open(&mut app, p, 0.5);
+        opened(&mut app, p, id, 0.5);
+        app
+    }
+
+    fn frame(app: &mut App, gpu: &mut NullGpu, p: &mut Mock, now: f64) {
+        app.update(now, p);
+        app.render(gpu);
+    }
+
+    /// The worker answers `reqs` for document 1; frames until they are uploaded.
+    fn deliver(app: &mut App, gpu: &mut NullGpu, p: &mut Mock, reqs: &[RenderReq], now: f64) {
+        for r in reqs {
+            let pixels = vec![0; (r.w * r.h * 4) as usize];
+            app.handle(Event::Worker(Msg::Tile { doc: 1, req: r.clone(), pixels }), now, p);
+        }
+        for i in 0..100 {
+            frame(app, gpu, p, now + i as f64 * 0.001);
+        }
+        assert!(app.uploads.is_empty());
+    }
+
+    #[test]
+    fn requests_tiles_again_after_the_cache_is_cleared() {
+        let (mut p, mut gpu) = (Mock::default(), NullGpu::default());
+        let mut app = app_with_doc(1080, &mut p);
+        frame(&mut app, &mut gpu, &mut p, 1.0);
+        let sent = app.sent.clone();
+        deliver(&mut app, &mut gpu, &mut p, &sent, 1.0);
+        assert!(app.tiles.contains(&PAGE0));
+
+        // A rotation: new layout, every tile is dropped when the next frame is drawn.
+        app.resize(1000, 2340);
+        frame(&mut app, &mut gpu, &mut p, 2.0);
+        assert!(!app.tiles.contains(&PAGE0));
+        // The render loop may sleep now, so the visible tiles must already be on their way.
+        let r = app.sent.iter().find(|r| r.key == PAGE0).expect("visible tile requested again");
+        assert_eq!(r.page_w, 1000);
+    }
+
+    #[test]
+    fn drops_tiles_rendered_for_an_old_layout() {
+        let (mut p, mut gpu) = (Mock::default(), NullGpu::default());
+        let mut app = app_with_doc(1000, &mut p);
+        frame(&mut app, &mut gpu, &mut p, 1.0);
+        let old: Vec<RenderReq> = app.sent.iter().filter(|r| !r.key.is_thumb()).cloned().collect();
+        assert!(old.iter().any(|r| r.key == PAGE0 && r.page_w == 1000));
+
+        app.resize(1080, 2340);
+        frame(&mut app, &mut gpu, &mut p, 2.0);
+        // Tiles rendered for the old width arrive after the change: same keys, other pixels.
+        deliver(&mut app, &mut gpu, &mut p, &old, 2.0);
+        assert!(!app.tiles.contains(&PAGE0), "a tile of the old layout is shown");
+        let r = app.sent.iter().find(|r| r.key == PAGE0).expect("dropped tile requested again");
+        assert_eq!(r.page_w, 1080);
+
+        let new = app.sent.clone();
+        deliver(&mut app, &mut gpu, &mut p, &new, 3.0);
+        let t = app.tiles.get(&PAGE0).expect("current tile accepted");
+        assert_eq!((t.w, t.tex_w), (1080, 1080));
+    }
+
+    fn touch(app: &mut App, p: &mut Mock, action: i32, x: f32, y: f32, time: f64, now: f64) {
+        app.handle(Event::Touch { action, index: 0, pointers: vec![(0, x, y)], time }, now, p);
+        app.update(now, p);
+    }
+
+    #[test]
+    fn double_tap_does_not_also_count_as_a_single_tap() {
+        let mut p = Mock::default();
+        let mut app = app_with_doc(1080, &mut p);
+        app.overlay = false;
+        let (x, y) = (540.0, 1170.0);
+        touch(&mut app, &mut p, ACTION_DOWN, x, y, 10.00, 1.00);
+        touch(&mut app, &mut p, ACTION_UP, x, y, 10.05, 1.05);
+        // A slowish second tap: still within the double-tap gap, and the
+        // finger is down when the first tap's timer would have run out.
+        touch(&mut app, &mut p, ACTION_DOWN, x, y, 10.30, 1.30);
+        app.update(1.33, &mut p);
+        touch(&mut app, &mut p, ACTION_UP, x, y, 10.36, 1.36);
+        app.update(2.0, &mut p);
+        assert!(!app.overlay, "the first tap toggled the overlay");
+        assert!(app.view.zoom > 2.0, "zoomed in by the double tap");
+
+        // A lone tap toggles the overlay once the double-tap window has passed.
+        touch(&mut app, &mut p, ACTION_DOWN, x, y, 20.00, 3.00);
+        touch(&mut app, &mut p, ACTION_UP, x, y, 20.05, 3.05);
+        app.update(3.2, &mut p);
+        assert!(!app.overlay);
+        app.update(3.4, &mut p);
+        assert!(app.overlay);
+    }
+
+    #[test]
+    fn opening_a_file_from_the_password_prompt_does_not_open_the_picker() {
+        let mut p = Mock::default();
+        let mut app = App::new(2.75, None, Box::new(|_: Msg| {}));
+        app.resize(1080, 2340);
+        let a = open(&mut app, &mut p, 0.1);
+        app.handle(Event::Worker(Msg::NeedPassword { doc: a, wrong: false }), 0.2, &mut p);
+        assert_eq!(app.mode, Mode::Password);
+        // "Open with" another file while the prompt is up.
+        let b = open(&mut app, &mut p, 0.3);
+        assert_eq!(app.mode, Mode::Read);
+        assert!(!p.log.contains(&"open_picker"));
+        assert!(app.pending.as_ref().is_some_and(|pd| pd.id == b));
+        // Cancelling the prompt of a file still gives up on it and shows the picker.
+        app.handle(Event::Worker(Msg::NeedPassword { doc: b, wrong: false }), 0.4, &mut p);
+        app.handle(Event::Back, 0.5, &mut p);
+        assert!(app.pending.is_none());
+        assert!(p.log.contains(&"open_picker"));
+    }
+
+    #[test]
+    fn password_prompt_stops_a_running_search() {
+        let mut p = Mock::default();
+        let mut app = app_with_doc(1080, &mut p);
+        app.set_mode(Mode::Search, &mut p);
+        app.handle(Event::Text { text: "lorem".into(), cursor: 5 }, 1.0, &mut p);
+        app.update(1.5, &mut p);
+        assert!(app.search.running);
+        let gen = app.search.gen;
+
+        let b = open(&mut app, &mut p, 2.0);
+        app.handle(Event::Worker(Msg::NeedPassword { doc: b, wrong: false }), 2.1, &mut p);
+        assert_eq!(app.mode, Mode::Password);
+        assert!(!app.search.running && app.search.gen != gen);
+        // Hits still coming in for the old search are ignored.
+        app.handle(Event::Worker(Msg::SearchHits { doc: 1, gen, page: 0, hits: vec![vec![[0.1, 0.1, 0.2, 0.2]]] }), 2.2, &mut p);
+        assert!(app.search.hits.is_empty());
+        // Cancelling keeps the current document.
+        app.handle(Event::Back, 2.3, &mut p);
+        assert_eq!(app.mode, Mode::Read);
+        assert!(app.has_document() && !p.log.contains(&"open_picker"));
+    }
+
+    #[test]
+    fn opening_message_gets_a_redraw() {
+        let mut p = Mock::default();
+        let mut app = App::new(2.75, None, Box::new(|_: Msg| {}));
+        app.resize(1080, 2340);
+        open(&mut app, &mut p, 1.0);
+        // Let the top bar finish fading in: nothing else asks for a frame then.
+        for t in [1.0, 1.1, 1.2, 1.25] {
+            app.update(t, &mut p);
+        }
+        app.dirty = false;
+        app.update(1.26, &mut p);
+        assert!(!app.needs_redraw());
+        let at = app.next_deadline().expect("wake up to show the message");
+        assert!((at - (1.0 + OPENING_DELAY)).abs() < 1e-9);
+        app.update(at, &mut p);
+        assert!(app.needs_redraw());
+    }
 }
