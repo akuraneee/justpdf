@@ -108,12 +108,35 @@ fn inside(r: [f32; 4], x: f32, y: f32) -> bool {
 #[derive(Clone, Copy, Debug)]
 enum Gesture {
     None,
-    Pending { x: f32, y: f32, t: f64, stopped: bool },
-    Drag { id: i32, x: f32, y: f32 },
-    Pinch { d0: f64, z0: f64, doc: (f64, f64) },
-    Button { hit: Hit, r: [f32; 4], inside: bool },
+    Pending {
+        x: f32,
+        y: f32,
+        t: f64,
+        stopped: bool,
+    },
+    Drag {
+        id: i32,
+        x: f32,
+        y: f32,
+    },
+    Pinch {
+        d0: f64,
+        z0: f64,
+        doc: (f64, f64),
+    },
+    Button {
+        hit: Hit,
+        r: [f32; 4],
+        inside: bool,
+    },
     Scrollbar,
-    Panel { y: f32, start: f32, moved: bool },
+    /// Touch in the contents panel; `x`, `start`: window coordinates where it began.
+    Panel {
+        x: f32,
+        y: f32,
+        start: f32,
+        moved: bool,
+    },
     PanelOutside,
 }
 
@@ -162,10 +185,13 @@ struct SearchState {
 
 #[derive(Default)]
 struct Panel {
+    /// Slide-over drawer (not docked) is open.
     open: bool,
     t: f32,
     scroll: f64,
     fling: Option<Fling>,
+    /// Chapter the docked panel last scrolled to.
+    follow: Option<usize>,
 }
 
 struct Upload {
@@ -178,6 +204,10 @@ struct Upload {
 
 pub struct App {
     density: f32,
+    /// Window width; the document viewport is `vw` wide starting at window x `ox`
+    /// (non-zero while the contents panel is docked on the left).
+    win_w: f32,
+    ox: f32,
     vw: f32,
     vh: f32,
     insets: [f32; 4],
@@ -214,6 +244,8 @@ pub struct App {
     /// Keep the screen on (and what the platform was last told).
     caffeine: bool,
     caffeine_applied: Option<bool>,
+    /// Dock the contents panel at the side when the window is wide enough.
+    pin_chapters: bool,
     panel: Panel,
     search: SearchState,
     toast: Option<(String, f64)>,
@@ -260,8 +292,11 @@ impl App {
         let store = Store::load(files_dir);
         let spread = store.spread();
         let caffeine = store.caffeine();
+        let pin_chapters = store.pin_chapters();
         App {
             density: density.max(0.5),
+            win_w: 0.0,
+            ox: 0.0,
             vw: 0.0,
             vh: 0.0,
             insets: [0.0; 4],
@@ -294,6 +329,7 @@ impl App {
             spread,
             caffeine,
             caffeine_applied: None,
+            pin_chapters,
             panel: Panel::default(),
             search: SearchState::default(),
             toast: None,
@@ -399,8 +435,33 @@ impl App {
         self.insets[1] + self.bar_h()
     }
 
+    /// Width of the contents panel: the dock while docked, else the drawer.
     fn panel_w(&self) -> f32 {
-        self.dp(360.0).min(self.vw * 0.86)
+        if self.docked() {
+            self.ox
+        } else {
+            self.dp(360.0).min(self.win_w * 0.86)
+        }
+    }
+
+    fn docked(&self) -> bool {
+        self.ox > 0.0
+    }
+
+    /// Width the docked panel should have now, if it should be docked at all:
+    /// pinned, the document has chapters and the window leaves room to read.
+    fn dock_w(&self) -> Option<f32> {
+        if !self.pin_chapters || !self.doc.as_ref().is_some_and(|d| !d.outline.is_empty()) {
+            return None;
+        }
+        let w = (self.win_w * 0.32).clamp(self.dp(220.0), self.dp(340.0)).round();
+        (self.win_w - w >= self.dp(360.0)).then_some(w)
+    }
+
+    /// Pin button in the panel header (window coordinates, panel fully shown).
+    fn pin_rect(&self) -> [f32; 4] {
+        let b = self.dp(48.0);
+        [self.panel_w() - b - self.dp(4.0), self.insets[1] + self.dp(28.0) - b / 2.0, b, b]
     }
 
     fn panel_top(&self) -> f32 {
@@ -493,6 +554,38 @@ impl App {
 
     pub fn resize(&mut self, w: u32, h: u32) {
         let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+        if w == self.win_w && h == self.vh {
+            return;
+        }
+        self.win_w = w;
+        let screen = (w * h * 4.0) as usize;
+        self.tiles.budget = (screen * 8).clamp(96 << 20, 256 << 20);
+        self.update_dock(h);
+    }
+
+    /// Docks or undocks the contents panel as the preference, the document and
+    /// the window width require, resizing the document viewport to match.
+    fn update_dock(&mut self, h: f32) {
+        if self.win_w <= 0.0 {
+            return;
+        }
+        let was = self.docked();
+        self.ox = self.dock_w().unwrap_or(0.0);
+        self.set_viewport(self.win_w - self.ox, h);
+        if self.docked() && !was {
+            self.panel.open = false;
+            self.panel.t = 0.0;
+            self.panel.fling = None;
+            self.panel.follow = self.current_chapter();
+            if let Some(c) = self.panel.follow {
+                self.center_chapter(c);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Sets the document viewport size (px), rebuilding the layout on width changes.
+    fn set_viewport(&mut self, w: f32, h: f32) {
         if w == self.vw && h == self.vh {
             return;
         }
@@ -500,8 +593,6 @@ impl App {
         let pos = self.position();
         self.vw = w;
         self.vh = h;
-        let screen = (w * h * 4.0) as usize;
-        self.tiles.budget = (screen * 8).clamp(96 << 20, 256 << 20);
         if width_changed {
             self.clear_tiles = true;
             if let Some(d) = self.doc.as_mut() {
@@ -684,6 +775,7 @@ impl App {
             Msg::Outline { doc, items } => {
                 if let Some(d) = self.doc.as_mut().filter(|d| d.id == doc) {
                     d.outline = items;
+                    self.update_dock(self.vh);
                 }
             }
             Msg::Tile { doc, key, w, h, pixels } => {
@@ -918,6 +1010,12 @@ impl App {
 
     fn touch(&mut self, action: i32, index: usize, pointers: Vec<(i32, f32, f32)>, time: f64, p: &mut dyn Platform) {
         self.pointers = pointers;
+        // Everything but the docked panel works in document-viewport coordinates.
+        if self.ox != 0.0 {
+            for p in &mut self.pointers {
+                p.1 -= self.ox;
+            }
+        }
         let (px, py) = self.pointers.get(index).map_or((0.0, 0.0), |&(_, x, y)| (x, y));
         match action {
             ACTION_DOWN => self.on_down(px, py, time),
@@ -936,9 +1034,11 @@ impl App {
     fn on_down(&mut self, x: f32, y: f32, time: f64) {
         self.vel.reset();
         self.vel.add(time, x as f64, y as f64);
-        if self.panel.open {
+        let wx = x + self.ox;
+        if self.panel.open || (self.docked() && wx < self.ox) {
             self.panel.fling = None;
-            self.gesture = if x < self.panel_w() { Gesture::Panel { y, start: y, moved: false } } else { Gesture::PanelOutside };
+            let on_panel = wx < self.panel_w();
+            self.gesture = if on_panel { Gesture::Panel { x: wx, y, start: y, moved: false } } else { Gesture::PanelOutside };
             return;
         }
         let controls = self.overlay_t > 0.5 || self.mode != Mode::Read;
@@ -1036,7 +1136,7 @@ impl App {
                     self.scrollbar_to(cy);
                 }
             }
-            Gesture::Panel { y, start, moved } => {
+            Gesture::Panel { x, y, start, moved } => {
                 let Some(&(_, _, cy)) = self.pointers.first() else { return };
                 self.vel.add(time, 0.0, cy as f64);
                 let moved = moved || (cy - start).abs() > slop;
@@ -1044,7 +1144,7 @@ impl App {
                     let max = self.panel_max_scroll();
                     self.panel.scroll = (self.panel.scroll - (cy - y) as f64).clamp(0.0, max);
                 }
-                self.gesture = Gesture::Panel { y: cy, start, moved };
+                self.gesture = Gesture::Panel { x, y: cy, start, moved };
             }
             Gesture::PanelOutside | Gesture::None => {}
         }
@@ -1090,10 +1190,15 @@ impl App {
                 }
             }
             Gesture::Scrollbar => {}
-            Gesture::Panel { moved, .. } => {
+            Gesture::Panel { x: sx, start, moved, .. } => {
                 if moved {
                     let (_, vy) = self.vel.velocity(time);
                     self.panel.fling = Fling::new(self.now, 0.0, vy, self.density as f64);
+                } else if start < self.panel_top() {
+                    let r = self.pin_rect();
+                    if inside(r, sx, start) && inside(r, x + self.ox, y) {
+                        self.toggle_pin();
+                    }
                 } else {
                     let row = ((y - self.panel_top()) as f64 + self.panel.scroll) / self.row_h();
                     if row >= 0.0 && y >= self.panel_top() {
@@ -1135,7 +1240,13 @@ impl App {
         match hit {
             Hit::Open => p.open_picker(),
             Hit::Search => self.set_mode(Mode::Search, p),
-            Hit::Chapters => self.open_panel(),
+            Hit::Chapters => {
+                if self.docked() {
+                    self.toggle_pin();
+                } else {
+                    self.open_panel();
+                }
+            }
             Hit::Spread => self.toggle_spread(),
             Hit::Caffeine => {
                 self.caffeine = !self.caffeine;
@@ -1188,10 +1299,28 @@ impl App {
             return;
         }
         let cur = self.current_chapter().unwrap_or(0);
-        let visible = (self.vh - self.insets[3] - self.panel_top()) as f64;
-        self.panel.scroll = (cur as f64 * self.row_h() - visible / 2.0 + self.row_h() / 2.0).clamp(0.0, self.panel_max_scroll());
+        self.center_chapter(cur);
         self.panel.open = true;
         self.panel.fling = None;
+    }
+
+    /// Scrolls the contents list so chapter `i` is in the middle.
+    fn center_chapter(&mut self, i: usize) {
+        let visible = (self.vh - self.insets[3] - self.panel_top()) as f64;
+        self.panel.scroll = (i as f64 * self.row_h() - visible / 2.0 + self.row_h() / 2.0).clamp(0.0, self.panel_max_scroll());
+    }
+
+    /// Pins or unpins the contents panel; docks it right away if the window allows.
+    fn toggle_pin(&mut self) {
+        self.pin_chapters = !self.pin_chapters;
+        self.store.set_pin_chapters(self.pin_chapters);
+        if !self.pin_chapters {
+            self.panel.open = false;
+        }
+        self.update_dock(self.vh);
+        if self.pin_chapters && !self.docked() {
+            self.toast("Contents will stay pinned when the window is wide enough");
+        }
     }
 
     fn current_chapter(&self) -> Option<usize> {
@@ -1309,6 +1438,22 @@ impl App {
         }
         if self.search.debounce.is_some_and(|d| now >= d) {
             self.start_search();
+        }
+
+        if self.docked() && self.panel.fling.is_none() && !matches!(self.gesture, Gesture::Panel { .. }) {
+            let cur = self.current_chapter();
+            if cur != self.panel.follow {
+                self.panel.follow = cur;
+                if let Some(c) = cur {
+                    // Keep the current chapter in view as reading moves on.
+                    let row = c as f64 * self.row_h();
+                    let visible = (self.vh - self.insets[3] - self.panel_top()) as f64;
+                    if row < self.panel.scroll || row + self.row_h() > self.panel.scroll + visible {
+                        self.center_chapter(c);
+                    }
+                }
+                self.dirty = true;
+            }
         }
 
         if self.caffeine_applied != Some(self.caffeine) {
@@ -1517,9 +1662,10 @@ impl App {
             self.dirty = true;
         }
 
-        gpu.begin(self.vw as u32, self.vh as u32, ui::BG);
+        gpu.begin(self.win_w as u32, self.vh as u32, ui::BG);
         let atlas = self.text.flush(gpu);
-        let mut under = Painter::default();
+        let ox = self.ox;
+        let mut under = Painter { ox, ..Default::default() };
         let mut draws: Vec<(TileKey, [f32; 4])> = Vec::new();
         if let Some(l) = self.layout() {
             let v = self.view;
@@ -1552,11 +1698,11 @@ impl App {
         for (k, r) in &draws {
             self.tiles.touch(k, self.frame);
             if let Some(t) = self.tiles.get(k) {
-                gpu.draw_texture(t.tex, *r, t.uv(), t.clamp());
+                gpu.draw_texture(t.tex, [r[0] + ox, r[1], r[2], r[3]], t.uv(), t.clamp());
             }
         }
 
-        let mut over = Painter::default();
+        let mut over = Painter { ox, ..Default::default() };
         self.draw_highlights(&mut over);
         self.draw_overlay(&mut over);
         let atlas = self.text.flush(gpu);
@@ -1607,6 +1753,7 @@ impl App {
             p.circle(x + b / 2.0, cy, b / 2.0 - self.dp(2.0), fade(ui::PRESS, a));
         }
         let on = match hit {
+            Hit::Chapters => self.docked(),
             Hit::Spread => self.spread,
             Hit::Caffeine => self.caffeine,
             _ => false,
@@ -1660,7 +1807,7 @@ impl App {
                 self.buttons.push(Button { r: [0.0, 0.0, vw, self.bar_bottom()], hit: Hit::Bar });
             }
             let cy = top + self.bar_h() / 2.0;
-            let left = self.insets[0] + self.dp(4.0);
+            let left = (self.insets[0] - self.ox).max(0.0) + self.dp(4.0);
             let right = vw - self.insets[2] - self.dp(4.0);
             match self.mode {
                 Mode::Read => {
@@ -1759,8 +1906,11 @@ impl App {
             }
         }
 
-        if self.panel.t > 0.001 {
+        if self.docked() || self.panel.t > 0.001 {
+            // The panel lives in window coordinates, left of the document viewport.
+            let ox = std::mem::replace(&mut p.ox, 0.0);
             self.draw_panel(p);
+            p.ox = ox;
         }
 
         if self.doc.is_none() {
@@ -1787,12 +1937,18 @@ impl App {
     }
 
     fn draw_panel(&mut self, p: &mut Painter) {
-        let t = ease_out(self.panel.t as f64) as f32;
-        let (vw, vh) = (self.vw, self.vh);
+        let docked = self.docked();
+        let t = if docked { 1.0 } else { ease_out(self.panel.t as f64) as f32 };
+        let vh = self.vh;
         let pw = self.panel_w();
         let x0 = -pw * (1.0 - t);
-        p.rect(0.0, 0.0, vw, vh, [0, 0, 0, (130.0 * t) as u8], 0.0);
+        if !docked {
+            p.rect(0.0, 0.0, self.win_w, vh, [0, 0, 0, (130.0 * t) as u8], 0.0);
+        }
         p.rect(x0, 0.0, pw, vh, ui::PANEL, 0.0);
+        if docked {
+            p.rect(pw - 1.0, 0.0, 1.0, vh, [255, 255, 255, 18], 0.0);
+        }
         let Some(d) = &self.doc else { return };
         let items = d.outline.clone();
         let n_pages = d.sizes.len();
@@ -1801,6 +1957,8 @@ impl App {
         let row_h = self.row_h();
         let bottom = vh - self.insets[3];
         let first = (self.panel.scroll / row_h).floor().max(0.0) as usize;
+        // Keep text clear of a left display cutout / navigation bar.
+        let il = self.insets[0];
         let tpx = self.dp(15.0);
         let npx = self.dp(13.0);
         for (i, it) in items.iter().enumerate().skip(first) {
@@ -1818,7 +1976,7 @@ impl App {
             let nx = x0 + pw - self.dp(16.0) - nw;
             let base = y + rh / 2.0;
             self.text.draw(p, &num, nx, base + self.text.cap_height(npx) / 2.0, npx, ui::DIM, nw + 1.0);
-            let indent = self.dp(20.0) + self.dp(14.0) * it.depth.min(6) as f32;
+            let indent = il + self.dp(20.0) + self.dp(14.0) * it.depth.min(6) as f32;
             let tx = x0 + indent;
             let color = if it.depth == 0 { ui::FG } else { [205, 205, 212, 255] };
             let title = if it.title.is_empty() { "—" } else { it.title.as_str() };
@@ -1828,7 +1986,14 @@ impl App {
         p.rect(x0, 0.0, pw, top, ui::PANEL, 0.0);
         let hpx = self.dp(18.0);
         let baseline = self.insets[1] + self.dp(28.0) + self.text.cap_height(hpx) / 2.0;
-        self.text.draw(p, "Contents", x0 + self.dp(20.0), baseline, hpx, ui::FG, pw - self.dp(40.0));
+        let pin = self.pin_rect();
+        self.text.draw(p, "Contents", x0 + il + self.dp(20.0), baseline, hpx, ui::FG, (pin[0] - il - self.dp(24.0)).max(0.0));
+        let (bx, cy) = (x0 + pin[0] + pin[2] / 2.0, pin[1] + pin[3] / 2.0);
+        if matches!(self.gesture, Gesture::Panel { x, start, moved: false, .. } if inside(pin, x, start)) {
+            p.circle(bx, cy, pin[2] / 2.0 - self.dp(2.0), ui::PRESS);
+        }
+        let color = if self.pin_chapters { ui::ACCENT } else { ui::DIM };
+        ui::icon(p, Icon::Pin, bx, cy, self.dp(22.0), color);
         p.rect(x0, top - 1.0, pw, 1.0, [255, 255, 255, 18], 0.0);
     }
 }
