@@ -17,7 +17,7 @@ src/                Rust crate (cdylib libjustpdf.so + rlib for tests)
   gfx.rs            backend-neutral Gpu trait + SDF shape painter; NullGpu for tests
   gl.rs / egl.rs    OpenGL ES 3 backend and EGL context management
   ui.rs             palette + vector icons
-  store.rs          last reading position per URI (files/positions.tsv) + settings (files/settings.txt: spread=0|1)
+  store.rs          last reading position per URI (files/positions.tsv) + settings (files/settings.txt: spread=0|1, caffeine=0|1)
 android/            Java shim (MainActivity, ReaderView), manifest, resources
 examples/headless.rs  renders the real app offscreen via Mesa EGL and writes PNGs
 tests/pdf.rs        PDFium integration tests (need PDFIUM_PATH + JUSTPDF_TEST_PDF)
@@ -44,7 +44,7 @@ Search: worker folds each page's text once (lowercase, ligatures, whitespace, li
 
 Java ↔ Rust contract (names must match exactly; d8 only, no R8 so nothing is renamed):
 - Java → Rust: `MainActivity.native*` static methods ↔ `Java_dev_justpdf_MainActivity_native*` in `android.rs`.
-- Rust → Java: `openPicker()`, `showKeyboard(int,String)`, `hideKeyboard()`, `setSystemBars(boolean)`, `exitApp()` on the activity.
+- Rust → Java: `openPicker()`, `showKeyboard(int,String)`, `hideKeyboard()`, `setSystemBars(boolean)`, `setKeepScreenOn(boolean)`, `exitApp()` on the activity.
 
 ## Building
 
@@ -69,7 +69,7 @@ cargo clippy --all-targets -- -D warnings       # CI enforces this (also check -
 PDFIUM_PATH=... cargo run --release --features headless --example headless -- /tmp/t.pdf /tmp/shots \
     shot:open drag:-2000 shot:scrolled tap:871,143 text:needle wait:800 shot:search
 ```
-Headless commands: `shot:NAME wait:MS idle drag:DY dragx:DX fling:DY tap:X,Y dtap:X,Y pinch:X,Y,F text:S ime back key:CODE` (1080×2340, density 2.75; top-bar buttons are at y≈143, search x≈871, chapters x≈1003).
+Headless commands: `shot:NAME wait:MS idle drag:DY dragx:DX fling:DY tap:X,Y dtap:X,Y pinch:X,Y,F text:S ime back key:CODE` (1080×2340, density 2.75; top-bar buttons are at y≈143, caffeine x≈607, spread x≈739, search x≈871, chapters x≈1003).
 
 ## Conventions
 - Keep the Java shim minimal; new behaviour goes in Rust (`app.rs`), with `Platform` trait methods for anything that needs Java.

@@ -25,6 +25,7 @@ pub enum Icon {
     Up,
     Down,
     Spread,
+    Caffeine,
 }
 
 /// Draws `icon` centred at (`cx`, `cy`); `size` is the 24-unit design grid in px.
@@ -57,6 +58,15 @@ pub fn icon(p: &mut Painter, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgb
             for x0 in [3.0, 13.0] {
                 let r = [(x0, 5.0), (x0 + 8.0, 5.0), (x0 + 8.0, 19.0), (x0, 19.0), (x0, 5.0)];
                 p.polyline(&r.map(|(x, y)| pt(x, y)), t, color);
+            }
+        }
+        Icon::Caffeine => {
+            // Coffee cup with a handle and two wisps of steam.
+            let cup = [(4.0, 10.0), (16.0, 10.0), (16.0, 16.0), (13.5, 19.5), (6.5, 19.5), (4.0, 16.0), (4.0, 10.0)];
+            p.polyline(&cup.map(|(x, y)| pt(x, y)), t, color);
+            p.polyline(&[pt(16.0, 11.5), pt(19.5, 11.5), pt(19.5, 15.0), pt(16.0, 15.0)], t, color);
+            for x in [8.0, 12.0] {
+                p.polyline(&[pt(x, 7.5), pt(x - 1.0, 6.0), pt(x, 4.5), pt(x - 1.0, 3.0)], 1.6 * k, color);
             }
         }
         Icon::Back => {

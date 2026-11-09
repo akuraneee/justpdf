@@ -139,6 +139,10 @@ impl Platform for Jni {
         self.call("setSystemBars", "(Z)V", &[JValue::Bool(visible as jboolean)]);
     }
 
+    fn keep_screen_on(&mut self, on: bool) {
+        self.call("setKeepScreenOn", "(Z)V", &[JValue::Bool(on as jboolean)]);
+    }
+
     fn exit(&mut self) {
         self.call("exitApp", "()V", &[]);
     }
