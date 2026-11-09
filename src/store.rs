@@ -20,6 +20,8 @@ pub struct Store {
     spread: bool,
     caffeine: bool,
     pin_chapters: bool,
+    /// Docked contents panel width in dp; 0 = automatic.
+    chapters_w: u32,
     /// Most recent first.
     entries: Vec<(String, Position)>,
     dirty: bool,
@@ -31,13 +33,19 @@ impl Store {
         let text = settings.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
         let flag = |key: &str| text.lines().filter_map(|l| l.trim().split_once('=')).any(|(k, v)| k == key && v == "1");
         let (spread, caffeine, pin_chapters) = (flag("spread"), flag("caffeine"), flag("pin_chapters"));
+        let chapters_w = text
+            .lines()
+            .filter_map(|l| l.trim().split_once('='))
+            .find(|(k, _)| *k == "chapters_w")
+            .and_then(|(_, v)| v.parse().ok())
+            .unwrap_or(0);
         let path = dir.map(|d| d.join("positions.tsv"));
         let entries = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| s.lines().filter_map(parse_line).collect())
             .unwrap_or_default();
-        Store { path, settings, spread, caffeine, pin_chapters, entries, dirty: false }
+        Store { path, settings, spread, caffeine, pin_chapters, chapters_w, entries, dirty: false }
     }
 
     /// Two-page spread mode (a global preference).
@@ -70,9 +78,22 @@ impl Store {
         self.save_settings();
     }
 
+    /// Width of the docked contents panel in dp (0: automatic).
+    pub fn chapters_w(&self) -> u32 {
+        self.chapters_w
+    }
+
+    pub fn set_chapters_w(&mut self, dp: u32) {
+        self.chapters_w = dp;
+        self.save_settings();
+    }
+
     fn save_settings(&self) {
         if let Some(p) = &self.settings {
-            let s = format!("spread={}\ncaffeine={}\npin_chapters={}\n", self.spread as u8, self.caffeine as u8, self.pin_chapters as u8);
+            let s = format!(
+                "spread={}\ncaffeine={}\npin_chapters={}\nchapters_w={}\n",
+                self.spread as u8, self.caffeine as u8, self.pin_chapters as u8, self.chapters_w
+            );
             let _ = std::fs::write(p, s);
         }
     }
@@ -148,6 +169,11 @@ mod tests {
         s3.set_pin_chapters(true);
         let s6 = Store::load(Some(dir.clone()));
         assert!(s6.pin_chapters() && s6.caffeine() && !s6.spread());
+        assert_eq!(s6.chapters_w(), 0);
+        s3.set_chapters_w(287);
+        let s7 = Store::load(Some(dir.clone()));
+        assert_eq!(s7.chapters_w(), 287);
+        assert!(s7.pin_chapters());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

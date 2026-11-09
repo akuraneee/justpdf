@@ -6,7 +6,7 @@
 //!
 //! Window size: JUSTPDF_HEADLESS_SIZE=WxH (default 1080x2340, density 2.75).
 //! Commands: shot:NAME, wait:MS, drag:DY, dragx:DX, fling:DY, tap:X,Y, dtap:X,Y,
-//! pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle
+//! swipe:X,Y,DX,DY, pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle
 
 use std::io::Write;
 use std::sync::mpsc;
@@ -197,6 +197,7 @@ fn main() {
             "drag" => h.drag(cx, cy, 0.0, nums[0], 20, 16),
             "dragx" => h.drag(cx, cy, nums[0], 0.0, 20, 16),
             "fling" => h.drag(cx, cy, 0.0, nums[0], 6, 8),
+            "swipe" => h.drag(nums[0], nums[1], nums[2], nums[3], 20, 16),
             "tap" => {
                 h.tap(nums[0], nums[1]);
                 h.run_for(350);

@@ -138,6 +138,13 @@ enum Gesture {
         moved: bool,
     },
     PanelOutside,
+    /// Dragging the docked panel's edge: preview width `w` (px); `grab` is the
+    /// finger's offset from the edge when it went down.
+    PanelResize {
+        w: f32,
+        grab: f32,
+        moved: bool,
+    },
 }
 
 struct Anim {
@@ -246,6 +253,8 @@ pub struct App {
     caffeine_applied: Option<bool>,
     /// Dock the contents panel at the side when the window is wide enough.
     pin_chapters: bool,
+    /// Docked panel width chosen by the user, in dp (0: automatic).
+    chapters_w: u32,
     panel: Panel,
     search: SearchState,
     toast: Option<(String, f64)>,
@@ -293,6 +302,7 @@ impl App {
         let spread = store.spread();
         let caffeine = store.caffeine();
         let pin_chapters = store.pin_chapters();
+        let chapters_w = store.chapters_w();
         App {
             density: density.max(0.5),
             win_w: 0.0,
@@ -330,6 +340,7 @@ impl App {
             caffeine,
             caffeine_applied: None,
             pin_chapters,
+            chapters_w,
             panel: Panel::default(),
             search: SearchState::default(),
             toast: None,
@@ -438,7 +449,10 @@ impl App {
     /// Width of the contents panel: the dock while docked, else the drawer.
     fn panel_w(&self) -> f32 {
         if self.docked() {
-            self.ox
+            match self.gesture {
+                Gesture::PanelResize { w, moved: true, .. } => w,
+                _ => self.ox,
+            }
         } else {
             self.dp(360.0).min(self.win_w * 0.86)
         }
@@ -454,8 +468,18 @@ impl App {
         if !self.pin_chapters || !self.doc.as_ref().is_some_and(|d| !d.outline.is_empty()) {
             return None;
         }
-        let w = (self.win_w * 0.32).clamp(self.dp(220.0), self.dp(340.0)).round();
-        (self.win_w - w >= self.dp(360.0)).then_some(w)
+        let (lo, hi) = self.dock_range()?;
+        let want =
+            if self.chapters_w > 0 { self.dp(self.chapters_w as f32) } else { (self.win_w * 0.32).clamp(self.dp(220.0), self.dp(340.0)) };
+        Some(want.clamp(lo, hi).round())
+    }
+
+    /// Widths (px) the docked panel may take in this window: at least 220 dp,
+    /// leaving at least 360 dp (and 40% of the window) for the document.
+    fn dock_range(&self) -> Option<(f32, f32)> {
+        let lo = self.dp(220.0);
+        let hi = (self.win_w - self.dp(360.0)).min(self.win_w * 0.6);
+        (hi >= lo).then_some((lo, hi))
     }
 
     /// Pin button in the panel header (window coordinates, panel fully shown).
@@ -1035,6 +1059,12 @@ impl App {
         self.vel.reset();
         self.vel.add(time, x as f64, y as f64);
         let wx = x + self.ox;
+        // Grab zone around the docked panel's edge (below the top bar).
+        if self.docked() && y > self.panel_top() && wx > self.ox - self.dp(10.0) && wx < self.ox + self.dp(14.0) {
+            self.panel.fling = None;
+            self.gesture = Gesture::PanelResize { w: self.ox, grab: wx - self.ox, moved: false };
+            return;
+        }
         if self.panel.open || (self.docked() && wx < self.ox) {
             self.panel.fling = None;
             let on_panel = wx < self.panel_w();
@@ -1146,6 +1176,16 @@ impl App {
                 }
                 self.gesture = Gesture::Panel { x, y: cy, start, moved };
             }
+            Gesture::PanelResize { w, grab, moved } => {
+                let Some(&(_, cx, _)) = self.pointers.first() else { return };
+                let edge = cx + self.ox - grab;
+                let moved = moved || (edge - self.ox).abs() > slop;
+                let w = match self.dock_range() {
+                    Some((lo, hi)) if moved => edge.clamp(lo, hi),
+                    _ => w,
+                };
+                self.gesture = Gesture::PanelResize { w, grab, moved };
+            }
             Gesture::PanelOutside | Gesture::None => {}
         }
     }
@@ -1212,6 +1252,13 @@ impl App {
                 }
             }
             Gesture::PanelOutside => self.panel.open = false,
+            Gesture::PanelResize { w, moved, .. } => {
+                if moved {
+                    self.chapters_w = (w / self.density).round() as u32;
+                    self.store.set_chapters_w(self.chapters_w);
+                    self.update_dock(self.vh);
+                }
+            }
             Gesture::None => {}
         }
     }
@@ -1946,7 +1993,10 @@ impl App {
             p.rect(0.0, 0.0, self.win_w, vh, [0, 0, 0, (130.0 * t) as u8], 0.0);
         }
         p.rect(x0, 0.0, pw, vh, ui::PANEL, 0.0);
+        let resizing = matches!(self.gesture, Gesture::PanelResize { .. });
         if docked {
+            // Shrinking preview: blank the strip the document will move into.
+            p.rect(pw, 0.0, self.ox - pw, vh, [18, 18, 20, 255], 0.0);
             p.rect(pw - 1.0, 0.0, 1.0, vh, [255, 255, 255, 18], 0.0);
         }
         let Some(d) = &self.doc else { return };
@@ -1995,6 +2045,13 @@ impl App {
         let color = if self.pin_chapters { ui::ACCENT } else { ui::DIM };
         ui::icon(p, Icon::Pin, bx, cy, self.dp(22.0), color);
         p.rect(x0, top - 1.0, pw, 1.0, [255, 255, 255, 18], 0.0);
+        if docked {
+            // Resize handle on the edge.
+            let (hw, hh) = if resizing { (self.dp(5.0), self.dp(56.0)) } else { (self.dp(4.0), self.dp(40.0)) };
+            let hy = top + (bottom - top) / 2.0;
+            let color = if resizing { ui::ACCENT } else { fade(ui::DIM, 0.7) };
+            p.rect(pw - hw / 2.0, hy - hh / 2.0, hw, hh, color, hw / 2.0);
+        }
     }
 }
 

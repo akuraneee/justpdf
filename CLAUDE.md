@@ -17,7 +17,7 @@ src/                Rust crate (cdylib libjustpdf.so + rlib for tests)
   gfx.rs            backend-neutral Gpu trait + SDF shape painter; NullGpu for tests
   gl.rs / egl.rs    OpenGL ES 3 backend and EGL context management
   ui.rs             palette + vector icons
-  store.rs          last reading position per URI (files/positions.tsv) + settings (files/settings.txt: spread=0|1, caffeine=0|1, pin_chapters=0|1)
+  store.rs          last reading position per URI (files/positions.tsv) + settings (files/settings.txt: spread=0|1, caffeine=0|1, pin_chapters=0|1, chapters_w=<dp, 0 = auto>)
 android/            Java shim (MainActivity, ReaderView), manifest, resources
 examples/headless.rs  renders the real app offscreen via Mesa EGL and writes PNGs
 tests/pdf.rs        PDFium integration tests (need PDFIUM_PATH + JUSTPDF_TEST_PDF)
@@ -35,7 +35,7 @@ Three threads:
 
 Rendering model:
 - Document space = "base px": each row spans the viewport width at zoom 1, rows stacked with no gap (`Layout`). A row is one page, or in spread mode two pages scaled to a common height that together fill the width (a lone last page is centred at half width). Every page has its own rect (`xs`, `widths`, `tops`, `heights`); `page_at`/`range` work on rows, `page_at` returns the row's first page. `screen = (doc - view.xy) * zoom`; f64 for scroll math. Toggling spread rebuilds the layout and tiles, keeping the current page.
-- The document viewport is `vw`×`vh` at window x `ox`. `ox > 0` while the contents panel is docked (pinned + document has an outline + window wide enough to leave ≥360 dp for reading); otherwise `vw == win_w`. Touch x is converted to viewport coordinates in `touch()`; document/overlay painters carry `Painter::ox`, the panel draws in window coordinates. Docking/undocking goes through `update_dock` → `set_viewport` (rebuilds the layout like a resize).
+- The document viewport is `vw`×`vh` at window x `ox`. `ox > 0` while the contents panel is docked (pinned + document has an outline + window wide enough to leave ≥360 dp for reading; width = `chapters_w` clamped to `dock_range`, resized by dragging the panel edge — the drag only previews, the viewport is rebuilt on release); otherwise `vw == win_w`. Touch x is converted to viewport coordinates in `touch()`; document/overlay painters carry `Painter::ox`, the panel draws in window coordinates. Docking/undocking goes through `update_dock` → `set_viewport` (rebuilds the layout like a resize).
 - Tiles are rendered at discrete levels `scale = 2^(level/4)` (`level_for_zoom`), max 2048 px wide (1024 when zoomed in) × 512 px tall, RGBX straight into GL textures. Plus one low-res thumbnail per page as placeholder for fast flings.
 - Draw order per frame: placeholders → fallback tiles (thumbs / other levels) only where current level is incomplete → current-level tiles → search highlights → overlay UI (single SDF vertex batch: rounded rects, rings, capsules, glyphs).
 - Page edges are snapped to whole pixels at 1:1 zoom; tile sampling is clamped to the valid texel area (no seams).
@@ -70,7 +70,7 @@ cargo clippy --all-targets -- -D warnings       # CI enforces this (also check -
 PDFIUM_PATH=... cargo run --release --features headless --example headless -- /tmp/t.pdf /tmp/shots \
     shot:open drag:-2000 shot:scrolled tap:871,143 text:needle wait:800 shot:search
 ```
-Headless commands (window size via `JUSTPDF_HEADLESS_SIZE=WxH`, e.g. 2340x1080 for landscape): `shot:NAME wait:MS idle drag:DY dragx:DX fling:DY tap:X,Y dtap:X,Y pinch:X,Y,F text:S ime back key:CODE` (1080×2340, density 2.75; top-bar buttons are at y≈143, caffeine x≈607, spread x≈739, search x≈871, chapters x≈1003).
+Headless commands (window size via `JUSTPDF_HEADLESS_SIZE=WxH`, e.g. 2340x1080 for landscape): `shot:NAME wait:MS idle drag:DY dragx:DX fling:DY swipe:X,Y,DX,DY tap:X,Y dtap:X,Y pinch:X,Y,F text:S ime back key:CODE` (1080×2340, density 2.75; top-bar buttons are at y≈143, caffeine x≈607, spread x≈739, search x≈871, chapters x≈1003).
 
 ## Conventions
 - Keep the Java shim minimal; new behaviour goes in Rust (`app.rs`), with `Platform` trait methods for anything that needs Java.
