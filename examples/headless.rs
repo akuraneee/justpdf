@@ -11,7 +11,8 @@ use std::io::Write;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use justpdf::app::{self, App, Event, Platform};
+use justpdf::android_codes;
+use justpdf::app::{App, Command, Event, TouchPhase};
 use justpdf::egl::Egl;
 use justpdf::gl::GlGpu;
 
@@ -19,34 +20,12 @@ const W: u32 = 1080;
 const H: u32 = 2340;
 const DENSITY: f32 = 2.75;
 
-#[derive(Default)]
-struct Mock {
-    log: Vec<String>,
-}
-
-impl Platform for Mock {
-    fn open_picker(&mut self) {
-        self.log.push("open_picker".into());
-    }
-    fn show_keyboard(&mut self, mode: i32, text: &str) {
-        self.log.push(format!("show_keyboard({mode}, {text:?})"));
-    }
-    fn hide_keyboard(&mut self) {
-        self.log.push("hide_keyboard".into());
-    }
-    fn system_bars(&mut self, visible: bool) {
-        self.log.push(format!("system_bars({visible})"));
-    }
-    fn exit(&mut self) {
-        self.log.push("exit".into());
-    }
-}
-
 struct Harness {
     app: App,
     gpu: GlGpu,
     rx: mpsc::Receiver<Event>,
-    mock: Mock,
+    /// Every platform command the app issued, in order.
+    commands: Vec<Command>,
     start: Instant,
     touch_t: f64,
 }
@@ -56,13 +35,23 @@ impl Harness {
         self.start.elapsed().as_secs_f64()
     }
 
+    fn event(&mut self, ev: Event) {
+        let t = self.now();
+        self.app.handle(ev, t);
+        self.commands.extend(self.app.drain_commands());
+    }
+
+    fn update(&mut self) {
+        let t = self.now();
+        self.app.update(t);
+        self.commands.extend(self.app.drain_commands());
+    }
+
     fn pump(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
-            let t = self.now();
-            self.app.handle(ev, t, &mut self.mock);
+            self.event(ev);
         }
-        let t = self.now();
-        self.app.update(t, &mut self.mock);
+        self.update();
         if self.app.needs_redraw() {
             self.app.render(&mut self.gpu);
         }
@@ -95,28 +84,27 @@ impl Harness {
         }
     }
 
-    fn touch(&mut self, action: i32, index: usize, pts: &[(f32, f32)]) {
+    fn touch(&mut self, phase: TouchPhase, index: usize, pts: &[(f32, f32)]) {
         self.touch_t += 0.008;
         let pointers = pts.iter().enumerate().map(|(i, &(x, y))| (i as i32, x, y)).collect();
-        let t = self.now();
-        self.app.handle(Event::Touch { action, index, pointers, time: self.touch_t }, t, &mut self.mock);
-        self.app.update(t, &mut self.mock);
+        self.event(Event::Touch { phase, index, pointers, time: self.touch_t });
+        self.update();
         self.app.render(&mut self.gpu);
     }
 
     fn drag(&mut self, x0: f32, y0: f32, dx: f32, dy: f32, steps: usize, step_ms: u64) {
-        self.touch(app::ACTION_DOWN, 0, &[(x0, y0)]);
+        self.touch(TouchPhase::Down, 0, &[(x0, y0)]);
         for i in 1..=steps {
             let f = i as f32 / steps as f32;
             std::thread::sleep(Duration::from_millis(step_ms));
-            self.touch(app::ACTION_MOVE, 0, &[(x0 + dx * f, y0 + dy * f)]);
+            self.touch(TouchPhase::Move, 0, &[(x0 + dx * f, y0 + dy * f)]);
         }
-        self.touch(app::ACTION_UP, 0, &[(x0 + dx, y0 + dy)]);
+        self.touch(TouchPhase::Up, 0, &[(x0 + dx, y0 + dy)]);
     }
 
     fn tap(&mut self, x: f32, y: f32) {
-        self.touch(app::ACTION_DOWN, 0, &[(x, y)]);
-        self.touch(app::ACTION_UP, 0, &[(x, y)]);
+        self.touch(TouchPhase::Down, 0, &[(x, y)]);
+        self.touch(TouchPhase::Up, 0, &[(x, y)]);
     }
 
     fn shot(&mut self, path: &str) {
@@ -152,16 +140,14 @@ fn main() {
     std::fs::create_dir_all(&files).unwrap();
     let mut app = App::new(DENSITY, Some(files), sink);
     app.resize(W, H);
-    let mut h = Harness { app, gpu, rx, mock: Mock::default(), start: Instant::now(), touch_t: 100.0 };
-    let t = h.now();
-    h.app.handle(Event::Insets([0.0, 66.0, 0.0, 44.0]), t, &mut h.mock);
+    let mut h = Harness { app, gpu, rx, commands: Vec::new(), start: Instant::now(), touch_t: 100.0 };
+    h.event(Event::Insets([0.0, 66.0, 0.0, 44.0]));
 
     let cpath = std::ffi::CString::new(pdf.as_str()).unwrap();
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     assert!(fd >= 0, "cannot open {pdf}");
     let name = std::path::Path::new(pdf).file_name().unwrap().to_string_lossy().into_owned();
-    let t = h.now();
-    h.app.handle(Event::Open { fd, uri: format!("file://{pdf}"), name }, t, &mut h.mock);
+    h.event(Event::Open { fd, uri: format!("file://{pdf}"), name });
     let t0 = Instant::now();
     while !h.app.has_document() && t0.elapsed() < Duration::from_secs(10) {
         h.pump();
@@ -196,33 +182,27 @@ fn main() {
             "pinch" => {
                 let (cx, cy, f) = (nums[0], nums[1], nums[2]);
                 let d0 = 150.0;
-                h.touch(app::ACTION_DOWN, 0, &[(cx - d0, cy)]);
-                h.touch(app::ACTION_POINTER_DOWN, 1, &[(cx - d0, cy), (cx + d0, cy)]);
+                h.touch(TouchPhase::Down, 0, &[(cx - d0, cy)]);
+                h.touch(TouchPhase::PointerDown, 1, &[(cx - d0, cy), (cx + d0, cy)]);
                 for i in 1..=15 {
                     let d = d0 * (1.0 + (f - 1.0) * i as f32 / 15.0);
-                    h.touch(app::ACTION_MOVE, 0, &[(cx - d, cy), (cx + d, cy)]);
+                    h.touch(TouchPhase::Move, 0, &[(cx - d, cy), (cx + d, cy)]);
                 }
                 let d = d0 * f;
-                h.touch(app::ACTION_POINTER_UP, 1, &[(cx - d, cy), (cx + d, cy)]);
-                h.touch(app::ACTION_UP, 0, &[(cx - d, cy)]);
+                h.touch(TouchPhase::PointerUp, 1, &[(cx - d, cy), (cx + d, cy)]);
+                h.touch(TouchPhase::Up, 0, &[(cx - d, cy)]);
             }
             "text" => {
-                let t = h.now();
                 let n = arg.encode_utf16().count();
-                h.app.handle(Event::Text { text: arg.to_string(), cursor: n }, t, &mut h.mock);
+                h.event(Event::Text { text: arg.to_string(), cursor: n });
             }
-            "ime" => {
-                let t = h.now();
-                h.app.handle(Event::ImeAction, t, &mut h.mock);
-            }
-            "back" => {
-                let t = h.now();
-                h.app.handle(Event::Back, t, &mut h.mock);
-            }
-            "key" => {
-                let t = h.now();
-                h.app.handle(Event::Key(nums[0] as i32), t, &mut h.mock);
-            }
+            "ime" => h.event(Event::ImeAction),
+            "back" => h.event(Event::Back),
+            // Android KeyEvent codes, mapped exactly as on device.
+            "key" => match android_codes::key(nums[0] as i32) {
+                Some(key) => h.event(Event::Key(key)),
+                None => eprintln!("unhandled key code {arg}"),
+            },
             _ => eprintln!("unknown command {cmd}"),
         }
         let rss =
@@ -232,7 +212,7 @@ fn main() {
         println!("  {cmd:<16} -> {:?} redraw={} rss={rss}MB {}", h.app.view(), h.app.needs_redraw(), h.app.stats());
     }
     println!("view: {:?}, mode: {:?}, {}", h.app.view(), h.app.mode(), h.app.stats());
-    println!("platform calls: {:?}", h.mock.log);
+    println!("platform commands: {:?}", h.commands);
     h.app.shutdown(Some(&mut h.gpu));
 }
 

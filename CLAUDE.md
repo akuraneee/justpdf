@@ -5,7 +5,8 @@ Minimal, fast Android PDF reader written in Rust: continuous vertical (webtoon) 
 ## Layout of the repo
 ```
 src/                Rust crate (cdylib libjustpdf.so + rlib for tests)
-  android.rs        JNI exports + render thread (EGL, frame loop, Java callbacks)
+  android.rs        JNI exports + render thread (EGL, frame loop, runs app Commands as Java calls)
+  android_codes.rs  Android MotionEvent actions / KeyEvent codes / IME modes <-> app enums (no JNI, host-tested)
   app.rs            platform-independent state machine: input, view, tile requests, overlay UI
   worker.rs         PDF worker thread: priority queue (control > visible tiles > search > prefetch)
   pdfium.rs         dlopen'ed PDFium bindings + Document wrapper (render, text, outline)
@@ -30,7 +31,7 @@ build.sh            Gradle-free APK build
 
 Three threads:
 1. **Java UI thread** (`MainActivity`, `ReaderView`): forwards surface/touch/key/IME/lifecycle callbacks over JNI; performs Java-only work when Rust asks (document picker, opening content URIs on a background thread → passes the fd, soft keyboard, system bars). Keep it thin — no logic in Java.
-2. **Render thread** (`android.rs::run`): owns EGL + `GlGpu` + `App`. Waits on a channel (or a deadline from `App::next_deadline`), drains events, calls `App::update`, renders when `needs_redraw`, swaps (vsync-paced). Votes 120 Hz via `ANativeWindow_setFrameRate` only while animating.
+2. **Render thread** (`android.rs::run`): owns EGL + `GlGpu` + `App`. Waits on a channel (or a deadline from `App::next_deadline`), drains events, calls `App::update`, runs the queued `App::drain_commands()` as Java calls, renders when `needs_redraw`, swaps (vsync-paced). Votes 120 Hz via `ANativeWindow_setFrameRate` only while animating.
 3. **PDF worker** (`worker.rs`): owns all PDFium state. The app *replaces* the whole render queue whenever the view changes, so stale requests vanish. PDFium is not thread-safe: every call holds `pdfium::LOCK`.
 
 Rendering model:
@@ -44,7 +45,8 @@ Search: worker folds each page's text once (lowercase, ligatures, whitespace, li
 
 Java ↔ Rust contract (names must match exactly; d8 only, no R8 so nothing is renamed):
 - Java → Rust: `MainActivity.native*` static methods ↔ `Java_dev_justpdf_MainActivity_native*` in `android.rs`.
-- Rust → Java: `openPicker()`, `showKeyboard(int,String)`, `hideKeyboard()`, `setSystemBars(boolean)`, `exitApp()` on the activity.
+- Rust → Java: `openPicker()`, `showKeyboard(int,String)`, `hideKeyboard()`, `setSystemBars(boolean)`, `exitApp()` on the activity — one per `app::Command` variant, dispatched only in `Jni::run` (`android.rs`).
+- Android numeric codes (touch actions, key codes, `ReaderView.IME_*`) are converted in `android_codes.rs`; `app.rs` only sees `TouchPhase`, `Key`, `Keyboard`.
 
 ## Building
 
@@ -72,7 +74,7 @@ PDFIUM_PATH=... cargo run --release --features headless --example headless -- /t
 Headless commands: `shot:NAME wait:MS idle drag:DY dragx:DX fling:DY tap:X,Y dtap:X,Y pinch:X,Y,F text:S ime back key:CODE` (1080×2340, density 2.75; top-bar buttons are at y≈143, search x≈871, chapters x≈1003).
 
 ## Conventions
-- Keep the Java shim minimal; new behaviour goes in Rust (`app.rs`), with `Platform` trait methods for anything that needs Java.
+- Keep the Java shim minimal; new behaviour goes in Rust (`app.rs`). Anything that needs Java is a new `app::Command` variant (queued with `self.command(..)`, executed in `android.rs`), never a JNI call from `app.rs`.
 - `App` must stay platform-independent (testable with `NullGpu` and the headless harness).
 - Never call PDFium outside the worker thread / without `pdfium::LOCK`.
 - Performance first: avoid per-frame allocations in hot paths, keep uploads bounded per frame (`process_uploads`), keep the render queue replace-based.

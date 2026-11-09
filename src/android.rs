@@ -15,7 +15,8 @@ use jni::objects::{GlobalRef, JClass, JFloatArray, JIntArray, JObject, JString, 
 use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 
-use crate::app::{App, Event, Platform};
+use crate::android_codes;
+use crate::app::{App, Command, Event};
 use crate::egl::{Egl, EGL_CONTEXT_LOST};
 use crate::gfx::Gpu;
 use crate::gl::GlGpu;
@@ -100,47 +101,30 @@ struct Jni {
 }
 
 impl Jni {
-    fn call(&self, name: &str, sig: &str, args: &[JValue]) {
+    /// Runs an app command as a call on the activity (the Rust -> Java contract).
+    fn run(&self, cmd: &Command) {
         let Ok(mut env) = self.vm.get_env() else { return };
+        let activity = self.activity.as_obj();
         let _ = env.with_local_frame(8, |env| -> jni::errors::Result<()> {
-            env.call_method(self.activity.as_obj(), name, sig, args)?;
+            match cmd {
+                Command::OpenPicker => env.call_method(activity, "openPicker", "()V", &[])?,
+                Command::ShowKeyboard(kb, text) => {
+                    let s = env.new_string(text)?;
+                    let mode = JValue::Int(android_codes::ime_mode(*kb));
+                    env.call_method(activity, "showKeyboard", "(ILjava/lang/String;)V", &[mode, JValue::Object(&s)])?
+                }
+                Command::HideKeyboard => env.call_method(activity, "hideKeyboard", "()V", &[])?,
+                Command::SystemBars(visible) => {
+                    env.call_method(activity, "setSystemBars", "(Z)V", &[JValue::Bool(*visible as jboolean)])?
+                }
+                Command::Exit => env.call_method(activity, "exitApp", "()V", &[])?,
+            };
             Ok(())
         });
         if env.exception_check().unwrap_or(false) {
             let _ = env.exception_describe();
             let _ = env.exception_clear();
         }
-    }
-}
-
-impl Platform for Jni {
-    fn open_picker(&mut self) {
-        self.call("openPicker", "()V", &[]);
-    }
-
-    fn show_keyboard(&mut self, mode: i32, text: &str) {
-        let Ok(mut env) = self.vm.get_env() else { return };
-        let activity = self.activity.as_obj();
-        let _ = env.with_local_frame(8, |env| -> jni::errors::Result<()> {
-            let s = env.new_string(text)?;
-            env.call_method(activity, "showKeyboard", "(ILjava/lang/String;)V", &[JValue::Int(mode), JValue::Object(&s)])?;
-            Ok(())
-        });
-        if env.exception_check().unwrap_or(false) {
-            let _ = env.exception_clear();
-        }
-    }
-
-    fn hide_keyboard(&mut self) {
-        self.call("hideKeyboard", "()V", &[]);
-    }
-
-    fn system_bars(&mut self, visible: bool) {
-        self.call("setSystemBars", "(Z)V", &[JValue::Bool(visible as jboolean)]);
-    }
-
-    fn exit(&mut self) {
-        self.call("exitApp", "()V", &[]);
     }
 }
 
@@ -170,7 +154,7 @@ fn run(vm: JavaVM, activity: GlobalRef, rx: Receiver<Cmd>, tx: Sender<Cmd>, shar
         crate::log_e!("attach failed: {e}");
         return;
     }
-    let mut platform = Jni { vm, activity };
+    let platform = Jni { vm, activity };
     let sink_tx = Mutex::new(tx);
     let sink = Box::new(move |m| {
         let _ = sink_tx.lock().unwrap_or_else(|e| e.into_inner()).send(Cmd::App(Event::Worker(m)));
@@ -206,7 +190,7 @@ fn run(vm: JavaVM, activity: GlobalRef, rx: Receiver<Cmd>, tx: Sender<Cmd>, shar
         pending.extend(rx.try_iter());
         for cmd in pending {
             match cmd {
-                Cmd::App(ev) => app.handle(ev, now(), &mut platform),
+                Cmd::App(ev) => app.handle(ev, now()),
                 Cmd::Surface(w) => {
                     if let Some(g) = gfx.as_mut() {
                         g.egl.detach_window();
@@ -240,7 +224,10 @@ fn run(vm: JavaVM, activity: GlobalRef, rx: Receiver<Cmd>, tx: Sender<Cmd>, shar
             }
         }
 
-        app.update(now(), &mut platform);
+        app.update(now());
+        for cmd in app.drain_commands() {
+            platform.run(&cmd);
+        }
         shared.back.store(app.back_consumable(), Ordering::Relaxed);
         let uri = app.current_uri().map(str::to_owned);
         if uri != last_uri {
@@ -379,6 +366,7 @@ pub extern "system" fn Java_dev_justpdf_MainActivity_nativeTouch<'l>(
     xy: JFloatArray<'l>,
     time_ms: jlong,
 ) {
+    let Some(phase) = android_codes::touch_phase(action) else { return };
     let n = count.clamp(0, 16) as usize;
     let mut id = vec![0i32; n];
     let mut pos = vec![0f32; n * 2];
@@ -386,7 +374,7 @@ pub extern "system" fn Java_dev_justpdf_MainActivity_nativeTouch<'l>(
         return;
     }
     let pointers = (0..n).map(|i| (id[i], pos[2 * i], pos[2 * i + 1])).collect();
-    send(h, Cmd::App(Event::Touch { action, index: index.max(0) as usize, pointers, time: time_ms as f64 / 1000.0 }));
+    send(h, Cmd::App(Event::Touch { phase, index: index.max(0) as usize, pointers, time: time_ms as f64 / 1000.0 }));
 }
 
 #[no_mangle]
@@ -403,7 +391,9 @@ pub extern "system" fn Java_dev_justpdf_MainActivity_nativeWheel(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_justpdf_MainActivity_nativeKey(_env: JNIEnv, _class: JClass, h: jlong, code: jint) {
-    send(h, Cmd::App(Event::Key(code)));
+    if let Some(key) = android_codes::key(code) {
+        send(h, Cmd::App(Event::Key(key)));
+    }
 }
 
 #[no_mangle]

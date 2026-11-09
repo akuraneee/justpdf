@@ -15,33 +15,62 @@ use crate::tiles::{TileCache, TileKey};
 use crate::ui::{self, fade, Icon};
 use crate::worker::{Msg, RenderReq, Sink, Worker};
 
-pub const KB_TEXT: i32 = 1;
-pub const KB_NUMBER: i32 = 2;
-pub const KB_PASSWORD: i32 = 3;
+/// Kind of soft keyboard to show.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Keyboard {
+    Text,
+    Number,
+    Password,
+}
 
-pub const ACTION_DOWN: i32 = 0;
-pub const ACTION_UP: i32 = 1;
-pub const ACTION_MOVE: i32 = 2;
-pub const ACTION_CANCEL: i32 = 3;
-pub const ACTION_POINTER_DOWN: i32 = 5;
-pub const ACTION_POINTER_UP: i32 = 6;
+/// Something only the host platform can do. The app queues these while handling
+/// events and updating; the platform loop runs them via [`App::drain_commands`].
+#[derive(Clone, PartialEq, Debug)]
+pub enum Command {
+    OpenPicker,
+    /// Show the soft keyboard for an editable field with this initial text.
+    ShowKeyboard(Keyboard, String),
+    HideKeyboard,
+    SystemBars(bool),
+    Exit,
+}
 
-/// Calls from the app into the host platform.
-pub trait Platform {
-    fn open_picker(&mut self);
-    fn show_keyboard(&mut self, mode: i32, text: &str);
-    fn hide_keyboard(&mut self);
-    fn system_bars(&mut self, visible: bool);
-    fn exit(&mut self);
+/// What happened to the pointer at `index` in a touch event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TouchPhase {
+    /// First finger down.
+    Down,
+    /// Another finger down.
+    PointerDown,
+    Move,
+    /// A finger up while others stay down.
+    PointerUp,
+    /// Last finger up.
+    Up,
+    Cancel,
+}
+
+/// Navigation keys (hardware keyboard, remote, etc.).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Key {
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Home,
+    End,
 }
 
 #[derive(Debug)]
 pub enum Event {
     /// Safe-area insets in px: left, top, right, bottom.
     Insets([f32; 4]),
-    /// Android MotionEvent: masked action, action index, (id, x, y) per pointer, event time in s.
+    /// `phase` applies to the pointer at `index`; `pointers` holds (id, x, y) for
+    /// every pointer currently down; `time` is the event time in s.
     Touch {
-        action: i32,
+        phase: TouchPhase,
         index: usize,
         pointers: Vec<(i32, f32, f32)>,
         time: f64,
@@ -51,7 +80,7 @@ pub enum Event {
         y: f32,
         delta: f32,
     },
-    Key(i32),
+    Key(Key),
     Back,
     Open {
         fd: i32,
@@ -225,6 +254,8 @@ pub struct App {
     buttons: Vec<Button>,
     frame: u64,
     dirty: bool,
+    /// Platform requests queued since the last `drain_commands`.
+    commands: Vec<Command>,
 }
 
 const TAP_TIMEOUT: f64 = 0.25;
@@ -300,11 +331,22 @@ impl App {
             buttons: Vec::new(),
             frame: 0,
             dirty: true,
+            commands: Vec::new(),
         }
     }
 
     fn dp(&self, v: f32) -> f32 {
         v * self.density
+    }
+
+    fn command(&mut self, c: Command) {
+        self.commands.push(c);
+    }
+
+    /// Platform requests queued by `handle`/`update`, in order. The platform loop
+    /// runs them after each batch of events.
+    pub fn drain_commands(&mut self) -> std::vec::Drain<'_, Command> {
+        self.commands.drain(..)
     }
 
     // ----- queries used by the platform loop -------------------------------------------
@@ -576,12 +618,12 @@ impl App {
 
     // ----- events -----------------------------------------------------------------------
 
-    pub fn handle(&mut self, ev: Event, now: f64, p: &mut dyn Platform) {
+    pub fn handle(&mut self, ev: Event, now: f64) {
         self.now = now;
         self.dirty = true;
         match ev {
             Event::Insets(i) => self.insets = i,
-            Event::Touch { action, index, pointers, time } => self.touch(action, index, pointers, time, p),
+            Event::Touch { phase, index, pointers, time } => self.touch(phase, index, pointers, time),
             Event::Wheel { delta, .. } => {
                 let dy = -(delta as f64) * self.dp(64.0) as f64 / self.view.zoom;
                 self.anim = None;
@@ -592,7 +634,7 @@ impl App {
             }
             Event::Key(code) => self.key(code),
             Event::Back => {
-                self.back(p);
+                self.back();
             }
             Event::Open { fd, uri, name } => {
                 self.save_position();
@@ -600,7 +642,7 @@ impl App {
                 self.next_id += 1;
                 self.worker.open(id, fd);
                 if self.mode == Mode::Password {
-                    self.set_mode(Mode::Read, p);
+                    self.set_mode(Mode::Read);
                 }
                 self.pending = Some(Pending { id, uri, name, since: now });
             }
@@ -608,12 +650,12 @@ impl App {
                 crate::log_w!("open failed: {msg}");
                 self.toast("Can't open this file");
                 if self.doc.is_none() && self.pending.is_none() {
-                    p.open_picker();
+                    self.command(Command::OpenPicker);
                 }
             }
             Event::PickerCancelled => {
                 if self.doc.is_none() && self.pending.is_none() {
-                    p.exit();
+                    self.command(Command::Exit);
                 }
             }
             Event::Text { text, cursor } => {
@@ -625,13 +667,13 @@ impl App {
                     }
                 }
             }
-            Event::ImeAction => self.ime_action(p),
+            Event::ImeAction => self.ime_action(),
             Event::Pause => self.save_position(),
-            Event::Worker(msg) => self.worker_msg(msg, p),
+            Event::Worker(msg) => self.worker_msg(msg),
         }
     }
 
-    fn worker_msg(&mut self, msg: Msg, p: &mut dyn Platform) {
+    fn worker_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Opened { doc, sizes } => {
                 let Some(pending) = self.pending.take_if(|pd| pd.id == doc) else { return };
@@ -643,7 +685,7 @@ impl App {
                 self.search = SearchState::default();
                 self.panel = Panel::default();
                 if self.mode != Mode::Read {
-                    self.set_mode(Mode::Read, p);
+                    self.set_mode(Mode::Read);
                 }
                 self.view = View::default();
                 self.ensure_layout();
@@ -656,7 +698,7 @@ impl App {
                     self.field.clear();
                     self.cursor = 0;
                     self.mode = Mode::Password;
-                    p.show_keyboard(KB_PASSWORD, "");
+                    self.command(Command::ShowKeyboard(Keyboard::Password, String::new()));
                     self.keyboard = true;
                     if wrong {
                         self.toast("Wrong password");
@@ -668,7 +710,7 @@ impl App {
                     crate::log_w!("cannot open: {error}");
                     self.toast("Can't open this file");
                     if self.doc.is_none() {
-                        p.open_picker();
+                        self.command(Command::OpenPicker);
                     }
                 }
             }
@@ -701,39 +743,38 @@ impl App {
         }
     }
 
-    fn key(&mut self, code: i32) {
+    fn key(&mut self, key: Key) {
         let vh = self.vh as f64 / self.view.zoom;
         let vw = self.vw as f64 / self.view.zoom;
         let v = self.view;
-        let to = match code {
-            20 => View { y: v.y + vh * 0.15, ..v },
-            19 => View { y: v.y - vh * 0.15, ..v },
-            93 | 62 => View { y: v.y + vh * 0.85, ..v },
-            92 => View { y: v.y - vh * 0.85, ..v },
-            122 => View { y: 0.0, ..v },
-            123 => View { y: f64::MAX / 4.0, ..v },
-            21 => View { x: v.x - vw * 0.2, ..v },
-            22 => View { x: v.x + vw * 0.2, ..v },
-            _ => return,
+        let to = match key {
+            Key::Down => View { y: v.y + vh * 0.15, ..v },
+            Key::Up => View { y: v.y - vh * 0.15, ..v },
+            Key::PageDown => View { y: v.y + vh * 0.85, ..v },
+            Key::PageUp => View { y: v.y - vh * 0.85, ..v },
+            Key::Home => View { y: 0.0, ..v },
+            Key::End => View { y: f64::MAX / 4.0, ..v },
+            Key::Left => View { x: v.x - vw * 0.2, ..v },
+            Key::Right => View { x: v.x + vw * 0.2, ..v },
         };
         self.scroll_dir = if to.y >= v.y { 1.0 } else { -1.0 };
         self.animate_to(to, 0.18);
         self.touch_activity();
     }
 
-    fn back(&mut self, p: &mut dyn Platform) -> bool {
+    fn back(&mut self) -> bool {
         if self.panel.open {
             self.panel.open = false;
             return true;
         }
         if self.mode != Mode::Read {
-            self.set_mode(Mode::Read, p);
+            self.set_mode(Mode::Read);
             return true;
         }
         false
     }
 
-    fn set_mode(&mut self, mode: Mode, p: &mut dyn Platform) {
+    fn set_mode(&mut self, mode: Mode) {
         let old = self.mode;
         if old == Mode::Search && mode != Mode::Search {
             self.search.text = self.field.clone();
@@ -745,7 +786,7 @@ impl App {
         if old == Mode::Password && mode != Mode::Password {
             self.pending = None;
             if self.doc.is_none() {
-                p.open_picker();
+                self.command(Command::OpenPicker);
             }
         }
         self.mode = mode;
@@ -753,7 +794,7 @@ impl App {
         match mode {
             Mode::Read => {
                 if self.keyboard {
-                    p.hide_keyboard();
+                    self.command(Command::HideKeyboard);
                     self.keyboard = false;
                 }
                 self.overlay = true;
@@ -762,7 +803,7 @@ impl App {
             Mode::Search => {
                 self.field = self.search.text.clone();
                 self.cursor = self.field.chars().count();
-                p.show_keyboard(KB_TEXT, &self.field);
+                self.command(Command::ShowKeyboard(Keyboard::Text, self.field.clone()));
                 self.keyboard = true;
                 if !self.field.is_empty() {
                     self.search.query.clear();
@@ -772,14 +813,14 @@ impl App {
             Mode::Goto => {
                 self.field.clear();
                 self.cursor = 0;
-                p.show_keyboard(KB_NUMBER, "");
+                self.command(Command::ShowKeyboard(Keyboard::Number, String::new()));
                 self.keyboard = true;
             }
             Mode::Password => {}
         }
     }
 
-    fn ime_action(&mut self, p: &mut dyn Platform) {
+    fn ime_action(&mut self) {
         match self.mode {
             Mode::Search => {
                 if self.search.debounce.is_some() || search::fold_query(&self.field) != self.search.query {
@@ -787,7 +828,7 @@ impl App {
                 } else {
                     self.step_match(1);
                 }
-                p.hide_keyboard();
+                self.command(Command::HideKeyboard);
                 self.keyboard = false;
             }
             Mode::Goto => {
@@ -795,7 +836,7 @@ impl App {
                 match self.field.trim().parse::<usize>() {
                     Ok(page) if page >= 1 && page <= n => {
                         self.jump_to(page - 1, 0.0);
-                        self.set_mode(Mode::Read, p);
+                        self.set_mode(Mode::Read);
                         self.overlay = false;
                     }
                     _ => self.toast(format!("Enter a page from 1 to {n}")),
@@ -804,7 +845,7 @@ impl App {
             Mode::Password => {
                 if let Some(pd) = &self.pending {
                     self.worker.password(pd.id, self.field.clone());
-                    p.hide_keyboard();
+                    self.command(Command::HideKeyboard);
                     self.keyboard = false;
                 }
             }
@@ -907,20 +948,19 @@ impl App {
 
     // ----- touch ------------------------------------------------------------------------
 
-    fn touch(&mut self, action: i32, index: usize, pointers: Vec<(i32, f32, f32)>, time: f64, p: &mut dyn Platform) {
+    fn touch(&mut self, phase: TouchPhase, index: usize, pointers: Vec<(i32, f32, f32)>, time: f64) {
         self.pointers = pointers;
         let (px, py) = self.pointers.get(index).map_or((0.0, 0.0), |&(_, x, y)| (x, y));
-        match action {
-            ACTION_DOWN => self.on_down(px, py, time),
-            ACTION_POINTER_DOWN => self.on_pointer_down(),
-            ACTION_MOVE => self.on_move(time),
-            ACTION_POINTER_UP => self.on_pointer_up(index),
-            ACTION_UP => self.on_up(px, py, time, p),
-            ACTION_CANCEL => {
+        match phase {
+            TouchPhase::Down => self.on_down(px, py, time),
+            TouchPhase::PointerDown => self.on_pointer_down(),
+            TouchPhase::Move => self.on_move(time),
+            TouchPhase::PointerUp => self.on_pointer_up(index),
+            TouchPhase::Up => self.on_up(px, py, time),
+            TouchPhase::Cancel => {
                 self.gesture = Gesture::None;
                 self.vel.reset();
             }
-            _ => {}
         }
     }
 
@@ -1050,7 +1090,7 @@ impl App {
         self.touch_activity();
     }
 
-    fn on_up(&mut self, x: f32, y: f32, time: f64, p: &mut dyn Platform) {
+    fn on_up(&mut self, x: f32, y: f32, time: f64) {
         let gesture = std::mem::replace(&mut self.gesture, Gesture::None);
         match gesture {
             Gesture::Pending { t, stopped, .. } => {
@@ -1077,7 +1117,7 @@ impl App {
             }
             Gesture::Button { hit, r, .. } => {
                 if inside(r, x, y) {
-                    self.press(hit, p);
+                    self.press(hit);
                 }
             }
             Gesture::Scrollbar => {}
@@ -1102,9 +1142,9 @@ impl App {
         }
     }
 
-    fn single_tap(&mut self, _x: f32, _y: f32, p: &mut dyn Platform) {
+    fn single_tap(&mut self, _x: f32, _y: f32) {
         if self.keyboard && self.mode != Mode::Read {
-            p.hide_keyboard();
+            self.command(Command::HideKeyboard);
             self.keyboard = false;
             return;
         }
@@ -1121,28 +1161,28 @@ impl App {
         self.animate_to(to, 0.22);
     }
 
-    fn press(&mut self, hit: Hit, p: &mut dyn Platform) {
+    fn press(&mut self, hit: Hit) {
         self.overlay_until = self.now + OVERLAY_TIMEOUT;
         match hit {
-            Hit::Open => p.open_picker(),
-            Hit::Search => self.set_mode(Mode::Search, p),
+            Hit::Open => self.command(Command::OpenPicker),
+            Hit::Search => self.set_mode(Mode::Search),
             Hit::Chapters => self.open_panel(),
             Hit::Spread => self.toggle_spread(),
-            Hit::Close => self.set_mode(Mode::Read, p),
+            Hit::Close => self.set_mode(Mode::Read),
             Hit::Prev => self.step_match(-1),
             Hit::Next => self.step_match(1),
             Hit::Field => {
                 let kb = match self.mode {
-                    Mode::Goto => KB_NUMBER,
-                    Mode::Password => KB_PASSWORD,
-                    _ => KB_TEXT,
+                    Mode::Goto => Keyboard::Number,
+                    Mode::Password => Keyboard::Password,
+                    _ => Keyboard::Text,
                 };
-                p.show_keyboard(kb, &self.field);
+                self.command(Command::ShowKeyboard(kb, self.field.clone()));
                 self.keyboard = true;
             }
             Hit::Indicator => {
                 if self.mode == Mode::Read {
-                    self.set_mode(Mode::Goto, p);
+                    self.set_mode(Mode::Goto);
                 }
             }
             Hit::Bar => {}
@@ -1218,7 +1258,7 @@ impl App {
 
     // ----- per-frame update -------------------------------------------------------------
 
-    pub fn update(&mut self, now: f64, p: &mut dyn Platform) {
+    pub fn update(&mut self, now: f64) {
         let dt = (now - self.last_update).clamp(0.0, 0.1) as f32;
         self.last_update = now;
         self.now = now;
@@ -1226,7 +1266,7 @@ impl App {
         if let Some((at, x, y)) = self.tap_at {
             if now >= at {
                 self.tap_at = None;
-                self.single_tap(x, y, p);
+                self.single_tap(x, y);
             }
         }
 
@@ -1300,7 +1340,7 @@ impl App {
         let bars = self.overlay_visible();
         if self.bars != Some(bars) {
             self.bars = Some(bars);
-            p.system_bars(bars);
+            self.command(Command::SystemBars(bars));
         }
 
         let settled = self.anim.is_none() && !matches!(self.gesture, Gesture::Pinch { .. });
@@ -1817,4 +1857,30 @@ fn utf16_to_char_index(s: &str, utf16: usize) -> usize {
         units += c.len_utf16();
     }
     s.chars().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(2.0, None, Box::new(|_| {}))
+    }
+
+    #[test]
+    fn picker_cancelled_without_document_exits() {
+        let mut a = app();
+        a.handle(Event::PickerCancelled, 0.0);
+        assert_eq!(a.drain_commands().collect::<Vec<_>>(), [Command::Exit]);
+        assert_eq!(a.drain_commands().count(), 0);
+    }
+
+    #[test]
+    fn system_bars_sent_once_per_change() {
+        let mut a = app();
+        a.update(0.0);
+        assert_eq!(a.drain_commands().collect::<Vec<_>>(), [Command::SystemBars(true)]);
+        a.update(0.1);
+        assert_eq!(a.drain_commands().count(), 0);
+    }
 }

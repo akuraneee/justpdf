@@ -2,13 +2,16 @@
 //!
 //! Architecture (see CLAUDE.md for the full picture):
 //! - `android`: JNI entry points + render thread (EGL, frame loop).
-//! - `app`: platform-independent state machine (input, view, tiles, UI).
+//! - `android_codes`: Android input/IME codes <-> app types (no JNI, host-testable).
+//! - `app`: platform-independent state machine (input, view, tiles, UI); talks
+//!   back to the platform only through queued `Command`s.
 //! - `worker`: PDFium thread with a priority queue (tiles, search, outline).
 //! - `pdfium`: dlopen'ed PDFium bindings.
 //! - `gl`/`egl`: OpenGL ES 3 backend; `gfx`: backend-neutral drawing API.
 
 pub mod log;
 
+pub mod android_codes;
 pub mod app;
 pub mod gesture;
 pub mod gfx;
