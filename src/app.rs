@@ -32,6 +32,8 @@ pub trait Platform {
     fn show_keyboard(&mut self, mode: i32, text: &str);
     fn hide_keyboard(&mut self);
     fn system_bars(&mut self, visible: bool);
+    /// Keep the display from turning off while the app is in the foreground.
+    fn keep_screen_on(&mut self, on: bool);
     fn exit(&mut self);
 }
 
@@ -89,6 +91,7 @@ enum Hit {
     Field,
     Indicator,
     Spread,
+    Caffeine,
     Bar,
 }
 
@@ -208,6 +211,9 @@ pub struct App {
     bars: Option<bool>,
     /// Two pages side by side per row.
     spread: bool,
+    /// Keep the screen on (and what the platform was last told).
+    caffeine: bool,
+    caffeine_applied: Option<bool>,
     panel: Panel,
     search: SearchState,
     toast: Option<(String, f64)>,
@@ -253,6 +259,7 @@ impl App {
     pub fn new(density: f32, files_dir: Option<PathBuf>, sink: Sink) -> App {
         let store = Store::load(files_dir);
         let spread = store.spread();
+        let caffeine = store.caffeine();
         App {
             density: density.max(0.5),
             vw: 0.0,
@@ -285,6 +292,8 @@ impl App {
             indicator_t: 0.0,
             bars: None,
             spread,
+            caffeine,
+            caffeine_applied: None,
             panel: Panel::default(),
             search: SearchState::default(),
             toast: None,
@@ -1128,6 +1137,11 @@ impl App {
             Hit::Search => self.set_mode(Mode::Search, p),
             Hit::Chapters => self.open_panel(),
             Hit::Spread => self.toggle_spread(),
+            Hit::Caffeine => {
+                self.caffeine = !self.caffeine;
+                self.store.set_caffeine(self.caffeine);
+                self.toast(if self.caffeine { "Screen stays on" } else { "Screen turns off as usual" });
+            }
             Hit::Close => self.set_mode(Mode::Read, p),
             Hit::Prev => self.step_match(-1),
             Hit::Next => self.step_match(1),
@@ -1297,6 +1311,10 @@ impl App {
             self.start_search();
         }
 
+        if self.caffeine_applied != Some(self.caffeine) {
+            self.caffeine_applied = Some(self.caffeine);
+            p.keep_screen_on(self.caffeine);
+        }
         let bars = self.overlay_visible();
         if self.bars != Some(bars) {
             self.bars = Some(bars);
@@ -1588,7 +1606,12 @@ impl App {
         if matches!(self.gesture, Gesture::Button { hit: h, inside: true, .. } if h == hit) {
             p.circle(x + b / 2.0, cy, b / 2.0 - self.dp(2.0), fade(ui::PRESS, a));
         }
-        let color = if hit == Hit::Spread && self.spread { ui::ACCENT } else { ui::FG };
+        let on = match hit {
+            Hit::Spread => self.spread,
+            Hit::Caffeine => self.caffeine,
+            _ => false,
+        };
+        let color = if on { ui::ACCENT } else { ui::FG };
         ui::icon(p, icon, x + b / 2.0, cy, self.dp(24.0), fade(color, a));
         self.buttons.push(Button { r, hit });
     }
@@ -1653,6 +1676,8 @@ impl App {
                         self.icon_button(p, Icon::Search, rx, cy, Hit::Search, a);
                         rx -= b;
                         self.icon_button(p, Icon::Spread, rx, cy, Hit::Spread, a);
+                        rx -= b;
+                        self.icon_button(p, Icon::Caffeine, rx, cy, Hit::Caffeine, a);
                     }
                     let title = match (&self.doc, &self.pending) {
                         (Some(d), _) => d.name.clone(),

@@ -37,6 +37,9 @@ impl Platform for Mock {
     fn system_bars(&mut self, visible: bool) {
         self.log.push(format!("system_bars({visible})"));
     }
+    fn keep_screen_on(&mut self, on: bool) {
+        self.log.push(format!("keep_screen_on({on})"));
+    }
     fn exit(&mut self) {
         self.log.push("exit".into());
     }

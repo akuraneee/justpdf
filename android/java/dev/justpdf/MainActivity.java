@@ -24,7 +24,7 @@ import android.window.OnBackInvokedDispatcher;
  * Thin platform shim. Everything (rendering, input handling, UI, PDF) lives in
  * the Rust library; this class only forwards Android callbacks and performs the
  * few operations that require Java APIs: the document picker, opening content
- * URIs, the soft keyboard and system bar visibility.
+ * URIs, the soft keyboard, system bar visibility and keeping the screen on.
  */
 public final class MainActivity extends Activity implements SurfaceHolder.Callback {
     static {
@@ -368,6 +368,16 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                             | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
                 }
                 view.setSystemUiVisibility(flags);
+            }
+        });
+    }
+
+    void setKeepScreenOn(final boolean on) {
+        runOnUiThread(() -> {
+            if (on) {
+                getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            } else {
+                getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
         });
     }

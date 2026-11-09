@@ -18,6 +18,7 @@ pub struct Store {
     path: Option<PathBuf>,
     settings: Option<PathBuf>,
     spread: bool,
+    caffeine: bool,
     /// Most recent first.
     entries: Vec<(String, Position)>,
     dirty: bool,
@@ -26,15 +27,16 @@ pub struct Store {
 impl Store {
     pub fn load(dir: Option<PathBuf>) -> Store {
         let settings = dir.as_ref().map(|d| d.join("settings.txt"));
-        let spread =
-            settings.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).is_some_and(|s| s.lines().any(|l| l.trim() == "spread=1"));
+        let text = settings.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        let flag = |key: &str| text.lines().filter_map(|l| l.trim().split_once('=')).any(|(k, v)| k == key && v == "1");
+        let (spread, caffeine) = (flag("spread"), flag("caffeine"));
         let path = dir.map(|d| d.join("positions.tsv"));
         let entries = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| s.lines().filter_map(parse_line).collect())
             .unwrap_or_default();
-        Store { path, settings, spread, entries, dirty: false }
+        Store { path, settings, spread, caffeine, entries, dirty: false }
     }
 
     /// Two-page spread mode (a global preference).
@@ -44,8 +46,22 @@ impl Store {
 
     pub fn set_spread(&mut self, on: bool) {
         self.spread = on;
+        self.save_settings();
+    }
+
+    /// Keep the screen on while reading (a global preference).
+    pub fn caffeine(&self) -> bool {
+        self.caffeine
+    }
+
+    pub fn set_caffeine(&mut self, on: bool) {
+        self.caffeine = on;
+        self.save_settings();
+    }
+
+    fn save_settings(&self) {
         if let Some(p) = &self.settings {
-            let _ = std::fs::write(p, format!("spread={}\n", on as u8));
+            let _ = std::fs::write(p, format!("spread={}\ncaffeine={}\n", self.spread as u8, self.caffeine as u8));
         }
     }
 
@@ -109,6 +125,13 @@ mod tests {
         let mut s3 = Store::load(Some(dir.clone()));
         s3.set_spread(true);
         assert!(Store::load(Some(dir.clone())).spread());
+        assert!(!Store::load(Some(dir.clone())).caffeine());
+        s3.set_caffeine(true);
+        let s4 = Store::load(Some(dir.clone()));
+        assert!(s4.spread() && s4.caffeine());
+        s3.set_spread(false);
+        let s5 = Store::load(Some(dir.clone()));
+        assert!(!s5.spread() && s5.caffeine());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
