@@ -39,6 +39,8 @@ pub fn alpha(c: Rgba, a: f32) -> Rgba {
 #[derive(Default)]
 pub struct Painter {
     pub v: Vec<UiVertex>,
+    /// Added to every x coordinate (draws content-area shapes into window space).
+    pub ox: f32,
 }
 
 impl Painter {
@@ -51,7 +53,8 @@ impl Painter {
             return;
         }
         for i in [0, 1, 2, 0, 2, 3] {
-            self.v.push(UiVertex { pos: corners[i], uv: uvs[i], color, p });
+            let pos = [corners[i][0] + self.ox, corners[i][1]];
+            self.v.push(UiVertex { pos, uv: uvs[i], color, p });
         }
     }
 

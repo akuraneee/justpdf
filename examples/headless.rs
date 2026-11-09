@@ -4,6 +4,7 @@
 //! cargo run --release --features headless --example headless -- file.pdf out_dir \
 //!     shot:open drag:-2000 wait:500 shot:scrolled tap:540,1200 ...
 //!
+//! Window size: JUSTPDF_HEADLESS_SIZE=WxH (default 1080x2340, density 2.75).
 //! Commands: shot:NAME, wait:MS, drag:DY, dragx:DX, fling:DY, tap:X,Y, dtap:X,Y,
 //! pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle
 
@@ -15,9 +16,15 @@ use justpdf::app::{self, App, Event, Platform};
 use justpdf::egl::Egl;
 use justpdf::gl::GlGpu;
 
-const W: u32 = 1080;
-const H: u32 = 2340;
 const DENSITY: f32 = 2.75;
+
+/// Window size: 1080×2340 (portrait phone) unless `JUSTPDF_HEADLESS_SIZE=WxH`.
+fn size() -> (u32, u32) {
+    std::env::var("JUSTPDF_HEADLESS_SIZE")
+        .ok()
+        .and_then(|s| s.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))))
+        .unwrap_or((1080, 2340))
+}
 
 #[derive(Default)]
 struct Mock {
@@ -130,7 +137,8 @@ impl Harness {
             eprintln!("GL error before={before:#x} after={err:#x}");
         }
         let px = self.gpu.read_pixels();
-        write_png(path, W, H, &px).expect("write png");
+        let (w, h) = size();
+        write_png(path, w, h, &px).expect("write png");
         println!("wrote {path}");
     }
 }
@@ -144,7 +152,9 @@ fn main() {
     let (pdf, out) = (&args[1], &args[2]);
     std::fs::create_dir_all(out).unwrap();
 
-    let _egl = Egl::new(W as i32, H as i32).expect("EGL");
+    let (w, h) = size();
+    let (cx, cy) = (w as f32 / 2.0, h as f32 / 2.0);
+    let _egl = Egl::new(w as i32, h as i32).expect("EGL");
     let gpu = GlGpu::new().expect("GL");
     let (tx, rx) = mpsc::channel();
     let sink_tx = std::sync::Mutex::new(tx.clone());
@@ -154,7 +164,7 @@ fn main() {
     let files = std::env::temp_dir().join("justpdf-headless");
     std::fs::create_dir_all(&files).unwrap();
     let mut app = App::new(DENSITY, Some(files), sink);
-    app.resize(W, H);
+    app.resize(w, h);
     let mut h = Harness { app, gpu, rx, mock: Mock::default(), start: Instant::now(), touch_t: 100.0 };
     let t = h.now();
     h.app.handle(Event::Insets([0.0, 66.0, 0.0, 44.0]), t, &mut h.mock);
@@ -184,9 +194,9 @@ fn main() {
             }
             "wait" => h.run_for(arg.parse().unwrap_or(100)),
             "idle" => h.settle(),
-            "drag" => h.drag(W as f32 / 2.0, H as f32 / 2.0, 0.0, nums[0], 20, 16),
-            "dragx" => h.drag(W as f32 / 2.0, H as f32 / 2.0, nums[0], 0.0, 20, 16),
-            "fling" => h.drag(W as f32 / 2.0, H as f32 / 2.0, 0.0, nums[0], 6, 8),
+            "drag" => h.drag(cx, cy, 0.0, nums[0], 20, 16),
+            "dragx" => h.drag(cx, cy, nums[0], 0.0, 20, 16),
+            "fling" => h.drag(cx, cy, 0.0, nums[0], 6, 8),
             "tap" => {
                 h.tap(nums[0], nums[1]);
                 h.run_for(350);

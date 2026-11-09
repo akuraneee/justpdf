@@ -19,6 +19,7 @@ pub struct Store {
     settings: Option<PathBuf>,
     spread: bool,
     caffeine: bool,
+    pin_chapters: bool,
     /// Most recent first.
     entries: Vec<(String, Position)>,
     dirty: bool,
@@ -29,14 +30,14 @@ impl Store {
         let settings = dir.as_ref().map(|d| d.join("settings.txt"));
         let text = settings.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
         let flag = |key: &str| text.lines().filter_map(|l| l.trim().split_once('=')).any(|(k, v)| k == key && v == "1");
-        let (spread, caffeine) = (flag("spread"), flag("caffeine"));
+        let (spread, caffeine, pin_chapters) = (flag("spread"), flag("caffeine"), flag("pin_chapters"));
         let path = dir.map(|d| d.join("positions.tsv"));
         let entries = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| s.lines().filter_map(parse_line).collect())
             .unwrap_or_default();
-        Store { path, settings, spread, caffeine, entries, dirty: false }
+        Store { path, settings, spread, caffeine, pin_chapters, entries, dirty: false }
     }
 
     /// Two-page spread mode (a global preference).
@@ -59,9 +60,20 @@ impl Store {
         self.save_settings();
     }
 
+    /// Keep the contents panel docked at the side (a global preference).
+    pub fn pin_chapters(&self) -> bool {
+        self.pin_chapters
+    }
+
+    pub fn set_pin_chapters(&mut self, on: bool) {
+        self.pin_chapters = on;
+        self.save_settings();
+    }
+
     fn save_settings(&self) {
         if let Some(p) = &self.settings {
-            let _ = std::fs::write(p, format!("spread={}\ncaffeine={}\n", self.spread as u8, self.caffeine as u8));
+            let s = format!("spread={}\ncaffeine={}\npin_chapters={}\n", self.spread as u8, self.caffeine as u8, self.pin_chapters as u8);
+            let _ = std::fs::write(p, s);
         }
     }
 
@@ -132,6 +144,10 @@ mod tests {
         s3.set_spread(false);
         let s5 = Store::load(Some(dir.clone()));
         assert!(!s5.spread() && s5.caffeine());
+        assert!(!s5.pin_chapters());
+        s3.set_pin_chapters(true);
+        let s6 = Store::load(Some(dir.clone()));
+        assert!(s6.pin_chapters() && s6.caffeine() && !s6.spread());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

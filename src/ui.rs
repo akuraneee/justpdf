@@ -26,6 +26,7 @@ pub enum Icon {
     Down,
     Spread,
     Caffeine,
+    Pin,
 }
 
 /// Draws `icon` centred at (`cx`, `cy`); `size` is the 24-unit design grid in px.
@@ -68,6 +69,15 @@ pub fn icon(p: &mut Painter, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgb
             for x in [8.0, 12.0] {
                 p.polyline(&[pt(x, 7.5), pt(x - 1.0, 6.0), pt(x, 4.5), pt(x - 1.0, 3.0)], 1.6 * k, color);
             }
+        }
+        Icon::Pin => {
+            // Push pin: head, tapered body, needle.
+            p.line(pt(8.5, 4.0).0, pt(8.5, 4.0).1, pt(15.5, 4.0).0, pt(15.5, 4.0).1, t, color);
+            let body = [(10.0, 4.0), (10.0, 9.5), (6.5, 13.5), (17.5, 13.5), (14.0, 9.5), (14.0, 4.0)];
+            p.polyline(&body.map(|(x, y)| pt(x, y)), t, color);
+            let (a, b) = pt(12.0, 13.5);
+            let (c, d) = pt(12.0, 20.5);
+            p.line(a, b, c, d, t, color);
         }
         Icon::Back => {
             let (a, b) = pt(19.5, 12.0);
