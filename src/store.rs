@@ -36,6 +36,8 @@ pub struct Store {
     chapters_w: u32,
     /// Library tab last shown: "" = recent, else a folder's tree URI.
     shelf: String,
+    /// Start in the library (else in the system file picker).
+    home: bool,
     /// Most recent first.
     entries: Vec<Entry>,
     dirty: bool,
@@ -50,13 +52,14 @@ impl Store {
         let value = |key: &str| text.lines().filter_map(|l| l.trim().split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| v);
         let chapters_w = value("chapters_w").and_then(|v| v.parse().ok()).unwrap_or(0);
         let shelf = value("shelf").unwrap_or("").to_string();
+        let home = value("home") != Some("0");
         let path = dir.map(|d| d.join("positions.tsv"));
         let entries = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| s.lines().filter_map(parse_line).collect())
             .unwrap_or_default();
-        Store { path, settings, spread, caffeine, pin_chapters, chapters_w, shelf, entries, dirty: false }
+        Store { path, settings, spread, caffeine, pin_chapters, chapters_w, shelf, home, entries, dirty: false }
     }
 
     /// Two-page spread mode (a global preference).
@@ -111,11 +114,21 @@ impl Store {
         }
     }
 
+    /// Start in the library; off: start in the system file picker (a global preference).
+    pub fn home(&self) -> bool {
+        self.home
+    }
+
+    pub fn set_home(&mut self, on: bool) {
+        self.home = on;
+        self.save_settings();
+    }
+
     fn save_settings(&self) {
         if let Some(p) = &self.settings {
             let s = format!(
-                "spread={}\ncaffeine={}\npin_chapters={}\nchapters_w={}\nshelf={}\n",
-                self.spread as u8, self.caffeine as u8, self.pin_chapters as u8, self.chapters_w, self.shelf
+                "spread={}\ncaffeine={}\npin_chapters={}\nchapters_w={}\nshelf={}\nhome={}\n",
+                self.spread as u8, self.caffeine as u8, self.pin_chapters as u8, self.chapters_w, self.shelf, self.home as u8
             );
             let _ = std::fs::write(p, s);
         }
@@ -245,6 +258,11 @@ mod tests {
         assert_eq!(s7.chapters_w(), 287);
         assert!(s7.pin_chapters());
         assert_eq!(s7.shelf(), "");
+        assert!(s7.home(), "the library is on by default");
+        s3.set_home(false);
+        assert!(!Store::load(Some(dir.clone())).home());
+        s3.set_home(true);
+        assert!(Store::load(Some(dir.clone())).home());
         s3.set_shelf("content://tree/x");
         assert_eq!(Store::load(Some(dir.clone())).shelf(), "content://tree/x");
 

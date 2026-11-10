@@ -70,6 +70,7 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
     static native void nativeOpen(long h, int fd, String uri, String name);
     static native void nativeOpenFailed(long h, String message);
     static native void nativePickerCancelled(long h);
+    static native void nativeNothingToOpen(long h);
     static native void nativeFolderPicked(long h, String uri, String name);
     static native void nativeFolderScanned(long h, String uri, String list, boolean ok);
     static native void nativeCoverFd(long h, long key, int fd);
@@ -123,12 +124,13 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
 
         handle = nativeCreate(this, getFilesDir().getAbsolutePath(), getResources().getDisplayMetrics().density);
 
-        // Without a document to open, the app starts in its library.
+        // Without a document to open, Rust shows the library (or the file
+        // picker, if the library is turned off).
         String saved = state != null ? state.getString(STATE_URI) : null;
         if (saved != null) {
             openUri(Uri.parse(saved), true);
-        } else {
-            handleIntent(getIntent());
+        } else if (!handleIntent(getIntent())) {
+            nativeNothingToOpen(handle);
         }
     }
 
@@ -469,8 +471,10 @@ public final class MainActivity extends Activity implements SurfaceHolder.Callba
                     return;
                 }
                 if (pfd == null) {
-                    // A document from the last session that is gone: just show the library.
-                    if (!restoring) {
+                    // A document from the last session that is gone: start as if fresh.
+                    if (restoring) {
+                        nativeNothingToOpen(handle);
+                    } else {
                         nativeOpenFailed(handle, "Cannot open " + uri);
                     }
                     return;

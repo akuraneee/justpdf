@@ -33,6 +33,8 @@ pub enum Icon {
     Library,
     /// Trash can.
     Remove,
+    /// Gear.
+    Settings,
 }
 
 /// Draws `icon` centred at (`cx`, `cy`); `size` is the 24-unit design grid in px.
@@ -108,6 +110,16 @@ pub fn icon(p: &mut Painter, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgb
                 let (a, b) = pt(x, 10.0);
                 let (c, d) = pt(x, 17.0);
                 p.line(a, b, c, d, 1.6 * k, color);
+            }
+        }
+        Icon::Settings => {
+            let (x, y) = pt(12.0, 12.0);
+            p.ring(x, y, 3.0 * k, t, color);
+            p.ring(x, y, 7.0 * k, t, color);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let (c, s) = (a.cos(), a.sin());
+                p.line(x + c * 7.5 * k, y + s * 7.5 * k, x + c * 10.0 * k, y + s * 10.0 * k, 2.6 * k, color);
             }
         }
         Icon::Back => {

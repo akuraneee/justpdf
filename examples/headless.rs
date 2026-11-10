@@ -10,7 +10,8 @@
 //!
 //! Window size: JUSTPDF_HEADLESS_SIZE=WxH (default 1080x2340, density 2.75).
 //! Commands: shot:NAME, wait:MS, drag:DY, dragx:DX, fling:DY, tap:X,Y, dtap:X,Y,
-//! swipe:X,Y,DX,DY, pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle
+//! swipe:X,Y,DX,DY, pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle,
+//! nothing (launch with nothing to open), cancel (file picker cancelled)
 
 use std::io::Write;
 use std::sync::mpsc;
@@ -289,6 +290,14 @@ fn main() {
             "ime" => {
                 let t = h.now();
                 h.app.handle(Event::ImeAction, t, &mut h.mock);
+            }
+            "nothing" => {
+                let t = h.now();
+                h.app.handle(Event::NothingToOpen, t, &mut h.mock);
+            }
+            "cancel" => {
+                let t = h.now();
+                h.app.handle(Event::PickerCancelled, t, &mut h.mock);
             }
             "back" => {
                 let t = h.now();

@@ -1,6 +1,6 @@
 # JustPDF
 
-Minimal, fast Android PDF reader written in Rust: continuous vertical (webtoon) scrolling, optional two-page spreads, chapters (PDF outline), full-text search. Launch → library (cover grid: recently opened documents + folders the user added, grouped by subfolder) → viewer; the system file picker is one button away. Also opens PDFs via "Open with" / "Share".
+Minimal, fast Android PDF reader written in Rust: continuous vertical (webtoon) scrolling, optional two-page spreads, chapters (PDF outline), full-text search. Launch → library (cover grid: recently opened documents + folders the user added, grouped by subfolder) → viewer; the system file picker is one button away. A setting ("Library at start", gear button in the reader and library top bars) turns the library off and restores the old flow: launch → system file picker → viewer, cancelling the picker with nothing open exits, the reader's Open button opens the picker. Also opens PDFs via "Open with" / "Share".
 
 ## Layout of the repo
 ```
@@ -20,7 +20,7 @@ src/                Rust crate (cdylib libjustpdf.so + rlib for tests)
   gfx.rs            backend-neutral Gpu trait + SDF shape painter; NullGpu for tests
   gl.rs / egl.rs    OpenGL ES 3 backend and EGL context management
   ui.rs             palette + vector icons
-  store.rs          last reading position + name + page count per URI, most recent first (files/positions.tsv; also the Recent tab) + settings (files/settings.txt: spread=0|1, caffeine=0|1, pin_chapters=0|1, chapters_w=<dp, 0 = auto>, shelf=<library tab: "" = Recent, else folder tree URI>)
+  store.rs          last reading position + name + page count per URI, most recent first (files/positions.tsv; also the Recent tab) + settings (files/settings.txt: spread=0|1, caffeine=0|1, pin_chapters=0|1, chapters_w=<dp, 0 = auto>, shelf=<library tab: "" = Recent, else folder tree URI>, home=0|1 (library at start, default 1))
 android/            Java shim (MainActivity, ReaderView), manifest, resources
 examples/headless.rs  renders the real app offscreen via Mesa EGL and writes PNGs (a directory argument = library mode)
 tests/pdf.rs        PDFium integration tests (need PDFIUM_PATH + JUSTPDF_TEST_PDF)
@@ -44,7 +44,7 @@ Rendering model:
 - Page edges are snapped to whole pixels at 1:1 zoom; tile sampling is clamped to the valid texel area (no seams).
 - Requests (`update_requests`) are *planned within the memory budget*: visible tiles (urgent, centre first) always; then one screen ahead in the scroll direction + half behind, then thumbnails ±2 screens, only while they fit in 90% of the budget. Tiles already uploaded or waiting in `uploads` (`in_flight`) are never re-requested. Eviction only drops tiles outside the wanted set (LRU) and never ones drawn this frame — evicting wanted tiles caused an endless render/evict loop (2+ GB) on device, so keep it that way. Budget ≈ 8 screens of RGBA (96–256 MB).
 
-Library (`app/shelf.rs`): shown whenever no document is open (so at launch) and over the document from the reader's top-left button (back returns to it). Tabs: Recent (`Store::recent`) and one per added folder; a folder's books are sorted naturally and grouped under subfolder headings. Folders are tree URIs with a persisted read permission; Java walks them (depth ≤ 8, ≤ 5000 PDFs) and returns "dir\tname\turi" lines; they are rescanned at launch and when the shelf is opened after ≥ 30 s. Covers: at most 4 jobs in flight, visible cells first — from the disk cache (`CoverSrc::Disk`), else Java opens an fd (`openCover` → `nativeCoverFd`) and the worker renders page 1 (`CoverSrc::Fd`), and a document opened in the reader caches its own cover (`CoverSrc::Doc`). Cover textures live only while the shelf is shown (≤ 150, LRU); the disk cache keeps 600. While the shelf is up the document's render queue is emptied.
+Library (`app/shelf.rs`): shown whenever no document is open and `home` is on (so at launch; Java reports `nativeNothingToOpen` when there is no intent/restored document, and with `home` off Rust then opens the picker) and over the document from the reader's top-left button (back returns to it). Tabs: Recent (`Store::recent`) and one per added folder; a folder's books are sorted naturally and grouped under subfolder headings. Folders are tree URIs with a persisted read permission; Java walks them (depth ≤ 8, ≤ 5000 PDFs) and returns "dir\tname\turi" lines; they are rescanned at launch and when the shelf is opened after ≥ 30 s. Covers: at most 4 jobs in flight, visible cells first — from the disk cache (`CoverSrc::Disk`), else Java opens an fd (`openCover` → `nativeCoverFd`) and the worker renders page 1 (`CoverSrc::Fd`), and a document opened in the reader caches its own cover (`CoverSrc::Doc`). Cover textures live only while the shelf is shown (≤ 150, LRU); the disk cache keeps 600. While the shelf is up the document's render queue is emptied.
 
 Search: worker folds each page's text once (lowercase, ligatures, whitespace, line-end hyphenation) and caches it; queries scan from the current page outward and stream hits per page; rects come from `FPDFText_GetRect` mapped through `FPDF_PageToDevice` to page fractions.
 
@@ -73,11 +73,11 @@ cargo clippy --all-targets -- -D warnings       # CI enforces this (also check -
 
 # Visual check without a device (Mesa EGL): screenshots of the real app
 PDFIUM_PATH=... cargo run --release --features headless --example headless -- /tmp/t.pdf /tmp/shots \
-    shot:open drag:-2000 shot:scrolled tap:871,143 text:needle wait:800 shot:search
+    shot:open drag:-2000 shot:scrolled tap:739,143 text:needle wait:800 shot:search
 ```
 Library mode: pass a directory instead of the PDF — it becomes a library folder (fresh settings each run) and the mock platform answers scans/opens/covers from the file system; the grid starts at y≈506 (first cover centre ≈ 198,722), the Recent chip is at ≈ 124,281. On a machine without a display set `EGL_PLATFORM=surfaceless` (needs libegl-dev/libgles-dev to link).
 
-Headless commands (window size via `JUSTPDF_HEADLESS_SIZE=WxH`, e.g. 2340x1080 for landscape): `shot:NAME wait:MS idle drag:DY dragx:DX fling:DY swipe:X,Y,DX,DY tap:X,Y dtap:X,Y pinch:X,Y,F text:S ime back key:CODE` (1080×2340, density 2.75; top-bar buttons are at y≈143, caffeine x≈607, spread x≈739, search x≈871, chapters x≈1003).
+Headless commands (window size via `JUSTPDF_HEADLESS_SIZE=WxH`, e.g. 2340x1080 for landscape): `shot:NAME wait:MS idle drag:DY dragx:DX fling:DY swipe:X,Y,DX,DY tap:X,Y dtap:X,Y pinch:X,Y,F text:S ime back key:CODE` (1080×2340, density 2.75; top-bar buttons are at y≈143, caffeine x≈475, spread x≈607, search x≈739, chapters x≈871, settings x≈1003 — without an outline everything left of settings moves right by 132; the settings menu's "Library at start" row is at ≈ 618,330). `nothing` = launch with nothing to open, `cancel` = file picker cancelled..
 
 ## Conventions
 - Keep the Java shim minimal; new behaviour goes in Rust (`app.rs`), with `Platform` trait methods for anything that needs Java.

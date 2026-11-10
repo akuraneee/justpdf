@@ -77,6 +77,8 @@ pub enum Event {
     },
     OpenFailed(String),
     PickerCancelled,
+    /// The app started (or a restored document is gone) with nothing to open.
+    NothingToOpen,
     /// A folder was chosen to add to the library.
     FolderPicked {
         uri: String,
@@ -128,6 +130,9 @@ enum Hit {
     ShelfOpenFile,
     ShelfAddFolder,
     ShelfRemove,
+    Settings,
+    /// The "library at start" row of the settings menu.
+    MenuHome,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -307,6 +312,10 @@ pub struct App {
     pin_chapters: bool,
     /// Docked panel width chosen by the user, in dp (0: automatic).
     chapters_w: u32,
+    /// Start in the library; off: the system file picker, as before the library existed.
+    home: bool,
+    /// The settings menu is open.
+    menu: bool,
     panel: Panel,
     search: SearchState,
     toast: Option<(String, f64)>,
@@ -358,6 +367,7 @@ impl App {
         let caffeine = store.caffeine();
         let pin_chapters = store.pin_chapters();
         let chapters_w = store.chapters_w();
+        let home = store.home();
         App {
             density: density.max(0.5),
             win_w: 0.0,
@@ -399,6 +409,8 @@ impl App {
             caffeine_applied: None,
             pin_chapters,
             chapters_w,
+            home,
+            menu: false,
             panel: Panel::default(),
             search: SearchState::default(),
             toast: None,
@@ -454,12 +466,18 @@ impl App {
 
     /// Whether a back press would be handled by the app (rather than exiting).
     pub fn back_consumable(&self) -> bool {
-        self.panel.open || self.mode != Mode::Read || (self.shelf.open && self.doc.is_some())
+        self.menu || self.panel.open || self.mode != Mode::Read || (self.shelf.open && self.doc.is_some())
     }
 
-    /// The library screen is up: always without a document, or over one.
+    /// The library screen is up: over a document, or as the home screen without one.
     pub fn shelf_visible(&self) -> bool {
-        self.shelf.open || self.doc.is_none()
+        self.shelf.open || (self.doc.is_none() && self.home)
+    }
+
+    /// Nothing is open or being opened and the library is off: the old flow,
+    /// where the app lives in the system file picker.
+    fn picker_home(&self) -> bool {
+        !self.home && self.doc.is_none() && self.pending.is_none()
     }
 
     /// Something is moving: render continuously.
@@ -486,7 +504,7 @@ impl App {
         if let Some((at, _, _)) = self.tap_at {
             add(at);
         }
-        if self.overlay && self.mode == Mode::Read && !self.panel.open {
+        if self.overlay && self.mode == Mode::Read && !self.panel.open && !self.menu {
             add(self.overlay_until);
         }
         if self.indicator_t > 0.0 {
@@ -578,7 +596,7 @@ impl App {
     }
 
     fn overlay_visible(&self) -> bool {
-        self.overlay || self.mode != Mode::Read || self.shelf_visible()
+        self.overlay || self.menu || self.mode != Mode::Read || self.shelf_visible()
     }
 
     fn indicator_target(&self) -> f32 {
@@ -804,8 +822,20 @@ impl App {
                 crate::log_w!("open failed: {msg}");
                 self.shelf.opening = None;
                 self.toast("Can't open this file");
+                if self.picker_home() {
+                    p.open_picker();
+                }
             }
-            Event::PickerCancelled => {}
+            Event::PickerCancelled => {
+                if self.picker_home() {
+                    p.exit();
+                }
+            }
+            Event::NothingToOpen => {
+                if self.picker_home() {
+                    p.open_picker();
+                }
+            }
             Event::FolderPicked { uri, name } => self.folder_picked(&uri, &name, p),
             Event::FolderScanned { uri, books, ok } => self.folder_scanned(&uri, books, ok),
             Event::CoverFd { key, fd } => self.cover_fd(key, fd),
@@ -866,6 +896,9 @@ impl App {
                     crate::log_w!("cannot open: {error}");
                     self.shelf.opening = None;
                     self.toast("Can't open this file");
+                    if self.picker_home() {
+                        p.open_picker();
+                    }
                 }
             }
             Msg::Outline { doc, items } => {
@@ -921,6 +954,10 @@ impl App {
     }
 
     fn back(&mut self, p: &mut dyn Platform) -> bool {
+        if self.menu {
+            self.menu = false;
+            return true;
+        }
         if self.panel.open {
             self.panel.open = false;
             return true;
@@ -948,9 +985,13 @@ impl App {
         if old == Mode::Password && mode != Mode::Password {
             self.pending = None;
             self.shelf.opening = None;
+            if self.picker_home() {
+                p.open_picker();
+            }
         }
         self.mode = mode;
         self.panel.open = false;
+        self.menu = false;
         match mode {
             Mode::Read => {
                 if self.keyboard {
@@ -1110,6 +1151,9 @@ impl App {
 
     fn touch(&mut self, action: i32, index: usize, pointers: Vec<(i32, f32, f32)>, time: f64, p: &mut dyn Platform) {
         self.pointers = pointers;
+        if self.menu {
+            return self.menu_touch(action, index, p);
+        }
         if self.shelf_visible() && self.mode != Mode::Password {
             // The library works in window coordinates.
             return self.shelf_touch(action, index, time, p);
@@ -1365,7 +1409,14 @@ impl App {
     fn press(&mut self, hit: Hit, p: &mut dyn Platform) {
         self.overlay_until = self.now + OVERLAY_TIMEOUT;
         match hit {
-            Hit::Open => self.show_shelf(p),
+            Hit::Open if self.home => self.show_shelf(p),
+            Hit::Open => p.open_picker(),
+            Hit::Settings => self.menu = !self.menu,
+            Hit::MenuHome => {
+                self.home = !self.home;
+                self.store.set_home(self.home);
+                self.invalidate();
+            }
             Hit::ShelfBack | Hit::ShelfOpenFile | Hit::ShelfAddFolder | Hit::ShelfRemove => self.shelf_press(hit, p),
             Hit::Search => self.set_mode(Mode::Search, p),
             Hit::Chapters => {
@@ -1549,7 +1600,7 @@ impl App {
             self.dirty = true;
         }
 
-        if self.overlay && self.mode == Mode::Read && !self.panel.open && now >= self.overlay_until {
+        if self.overlay && self.mode == Mode::Read && !self.panel.open && !self.menu && now >= self.overlay_until {
             self.overlay = false;
         }
         let step = dt / 0.15;
@@ -1899,6 +1950,7 @@ impl App {
             Hit::Chapters => self.docked(),
             Hit::Spread => self.spread,
             Hit::Caffeine => self.caffeine,
+            Hit::Settings => self.menu,
             _ => false,
         };
         let color = if on { ui::ACCENT } else { ui::FG };
@@ -1954,8 +2006,10 @@ impl App {
             let right = vw - self.insets[2] - self.dp(4.0);
             match self.mode {
                 Mode::Read => {
-                    self.icon_button(p, Icon::Library, left, cy, Hit::Open, a);
-                    let mut rx = right;
+                    let open = if self.home { Icon::Library } else { Icon::Open };
+                    self.icon_button(p, open, left, cy, Hit::Open, a);
+                    let mut rx = right - b;
+                    self.icon_button(p, Icon::Settings, rx, cy, Hit::Settings, a);
                     let has_outline = self.doc.as_ref().is_some_and(|d| !d.outline.is_empty());
                     if self.doc.is_some() {
                         if has_outline {
@@ -2067,7 +2121,73 @@ impl App {
             }
         }
 
+        if self.menu {
+            // The menu lives in window coordinates (right edge of the window).
+            let ox = std::mem::replace(&mut p.ox, 0.0);
+            self.draw_menu(p);
+            p.ox = ox;
+        }
         self.draw_toast(p, 0.0, vw);
+    }
+
+    /// The settings menu card, under the top bar at the right (window coordinates).
+    fn menu_rect(&self) -> [f32; 4] {
+        let w = self.dp(320.0).min(self.win_w - self.dp(16.0));
+        let x = self.win_w - self.insets[2] - self.dp(8.0) - w;
+        [x.max(self.dp(8.0)), self.bar_bottom() + self.dp(4.0), w, self.dp(72.0)]
+    }
+
+    fn draw_menu(&mut self, p: &mut Painter) {
+        let r = self.menu_rect();
+        p.rect(r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0, [0, 0, 0, 90], self.dp(13.0));
+        p.rect(r[0], r[1], r[2], r[3], [44, 44, 50, 255], self.dp(12.0));
+        if matches!(self.gesture, Gesture::Button { hit: Hit::MenuHome, inside: true, .. }) {
+            p.rect(r[0], r[1], r[2], r[3], ui::PRESS, self.dp(12.0));
+        }
+        self.buttons.push(Button { r, hit: Hit::MenuHome });
+        // Switch at the right.
+        let (sw, sh) = (self.dp(40.0), self.dp(22.0));
+        let sx = r[0] + r[2] - self.dp(16.0) - sw;
+        let cy = r[1] + r[3] / 2.0;
+        p.rect(sx, cy - sh / 2.0, sw, sh, if self.home { ui::ACCENT } else { [90, 90, 98, 255] }, sh / 2.0);
+        let kx = if self.home { sx + sw - sh / 2.0 } else { sx + sh / 2.0 };
+        p.circle(kx, cy, sh / 2.0 - self.dp(3.0), if self.home { [16, 24, 40, 255] } else { ui::FG });
+        let (tpx, spx) = (self.dp(15.0), self.dp(12.5));
+        let tx = r[0] + self.dp(16.0);
+        let max = (sx - self.dp(12.0) - tx).max(0.0);
+        self.text.draw(p, "Library at start", tx, cy - self.dp(4.0), tpx, ui::FG, max);
+        let sub = if self.home { "Book covers when the app opens" } else { "Off: the file picker opens, as before" };
+        self.text.draw(p, sub, tx, cy + self.dp(16.0), spx, ui::DIM, max);
+    }
+
+    /// Touches while the settings menu is open: its row toggles, anything else closes it.
+    fn menu_touch(&mut self, action: i32, index: usize, p: &mut dyn Platform) {
+        let (x, y) = self.pointers.get(index).map_or((0.0, 0.0), |&(_, x, y)| (x, y));
+        let r = self.menu_rect();
+        match action {
+            ACTION_DOWN => {
+                self.gesture = if inside(r, x, y) {
+                    Gesture::Button { hit: Hit::MenuHome, r, inside: true }
+                } else {
+                    // Closing the menu takes the whole gesture.
+                    self.menu = false;
+                    Gesture::None
+                };
+            }
+            ACTION_MOVE => {
+                if let (Gesture::Button { hit, r, .. }, Some(&(_, cx, cy))) = (self.gesture, self.pointers.first()) {
+                    self.gesture = Gesture::Button { hit, r, inside: inside(r, cx, cy) };
+                }
+            }
+            ACTION_UP => {
+                if let Gesture::Button { hit, r, .. } = std::mem::replace(&mut self.gesture, Gesture::None) {
+                    if inside(r, x, y) {
+                        self.press(hit, p);
+                    }
+                }
+            }
+            _ => self.gesture = Gesture::None,
+        }
     }
 
     /// The toast message, centred in the `w` wide area starting at `x0`.

@@ -748,6 +748,9 @@ impl App {
             over.ox = self.ox;
             self.draw_overlay(&mut over);
         } else {
+            if self.menu {
+                self.draw_menu(&mut over);
+            }
             self.draw_toast(&mut over, 0.0, self.win_w);
         }
 
@@ -783,6 +786,8 @@ impl App {
             tx = left + b + self.dp(8.0);
         }
         let mut rx = w - self.insets[2] - self.dp(4.0);
+        rx -= b;
+        self.icon_button(p, Icon::Settings, rx, cy, Hit::Settings, 1.0);
         rx -= b;
         self.icon_button(p, Icon::Open, rx, cy, Hit::ShelfAddFolder, 1.0);
         rx -= b;

@@ -497,6 +497,11 @@ pub extern "system" fn Java_dev_justpdf_MainActivity_nativePickerCancelled(_env:
 }
 
 #[no_mangle]
+pub extern "system" fn Java_dev_justpdf_MainActivity_nativeNothingToOpen(_env: JNIEnv, _class: JClass, h: jlong) {
+    send(h, Cmd::App(Event::NothingToOpen));
+}
+
+#[no_mangle]
 pub extern "system" fn Java_dev_justpdf_MainActivity_nativeFolderPicked<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
