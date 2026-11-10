@@ -68,7 +68,7 @@ fn worker_round_trip() {
     let Some(path) = test_pdf() else { return eprintln!("skipped: PDFIUM_PATH/JUSTPDF_TEST_PDF not set") };
     let (tx, rx) = mpsc::channel();
     let tx = std::sync::Mutex::new(tx);
-    let worker = Worker::new(Box::new(move |m| {
+    let worker = Worker::new(std::sync::Arc::new(move |m| {
         let _ = tx.lock().unwrap().send(m);
     }));
     worker.open(7, open_fd(&path));
@@ -109,7 +109,7 @@ fn worker_covers() {
     let dir = std::env::temp_dir().join(format!("justpdf-covers-it-{}", std::process::id()));
     let (tx, rx) = mpsc::channel();
     let tx = std::sync::Mutex::new(tx);
-    let worker = Worker::new(Box::new(move |m| {
+    let worker = Worker::new(std::sync::Arc::new(move |m| {
         let _ = tx.lock().unwrap().send(m);
     }));
     let next = || rx.recv_timeout(Duration::from_secs(10)).expect("worker reply");
