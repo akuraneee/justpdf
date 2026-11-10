@@ -125,6 +125,8 @@ enum Hit {
     Indicator,
     Spread,
     Caffeine,
+    /// Back to the default size: zoom 1, pages fill the width.
+    FitWidth,
     Bar,
     ShelfBack,
     ShelfOpenFile,
@@ -1427,6 +1429,7 @@ impl App {
                 }
             }
             Hit::Spread => self.toggle_spread(),
+            Hit::FitWidth => self.fit_width(),
             Hit::Caffeine => {
                 self.caffeine = !self.caffeine;
                 self.store.set_caffeine(self.caffeine);
@@ -1451,6 +1454,19 @@ impl App {
             }
             Hit::Bar => {}
         }
+    }
+
+    /// Whether the view is zoomed away from the default fit-width size.
+    fn zoomed(&self) -> bool {
+        (self.view.zoom - 1.0).abs() > 1e-3
+    }
+
+    /// Animates back to zoom 1 (rows span the viewport width), keeping the
+    /// document line at the middle of the screen in place.
+    fn fit_width(&mut self) {
+        let mut to = self.view.zoomed_at(1.0, self.vw as f64 / 2.0, self.vh as f64 / 2.0);
+        to.x = 0.0;
+        self.animate_to(to, 0.22);
     }
 
     /// Switches between one page and two pages per row, keeping the current page.
@@ -2022,6 +2038,10 @@ impl App {
                         self.icon_button(p, Icon::Spread, rx, cy, Hit::Spread, a);
                         rx -= b;
                         self.icon_button(p, Icon::Caffeine, rx, cy, Hit::Caffeine, a);
+                        if self.zoomed() {
+                            rx -= b;
+                            self.icon_button(p, Icon::FitWidth, rx, cy, Hit::FitWidth, a);
+                        }
                     }
                     let title = match (&self.doc, &self.pending) {
                         (Some(d), _) => d.name.clone(),

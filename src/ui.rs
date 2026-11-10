@@ -35,6 +35,8 @@ pub enum Icon {
     Remove,
     /// Gear.
     Settings,
+    /// Two edges with a double-headed arrow between them: fit to width.
+    FitWidth,
 }
 
 /// Draws `icon` centred at (`cx`, `cy`); `size` is the 24-unit design grid in px.
@@ -127,6 +129,18 @@ pub fn icon(p: &mut Painter, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgb
             let (c, d) = pt(5.0, 12.0);
             p.line(a, b, c, d, t, color);
             p.polyline(&[pt(11.0, 6.0), pt(5.0, 12.0), pt(11.0, 18.0)], t, color);
+        }
+        Icon::FitWidth => {
+            for x in [3.5, 20.5] {
+                let (a, b) = pt(x, 5.0);
+                let (c, d) = pt(x, 19.0);
+                p.line(a, b, c, d, t, color);
+            }
+            let (a, b) = pt(7.0, 12.0);
+            let (c, d) = pt(17.0, 12.0);
+            p.line(a, b, c, d, t, color);
+            p.polyline(&[pt(10.0, 9.0), pt(7.0, 12.0), pt(10.0, 15.0)], t, color);
+            p.polyline(&[pt(14.0, 9.0), pt(17.0, 12.0), pt(14.0, 15.0)], t, color);
         }
         Icon::Up => p.polyline(&[pt(6.0, 15.0), pt(12.0, 9.0), pt(18.0, 15.0)], t, color),
         Icon::Down => p.polyline(&[pt(6.0, 9.0), pt(12.0, 15.0), pt(18.0, 9.0)], t, color),
