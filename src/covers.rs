@@ -48,7 +48,7 @@ pub fn index(dir: &Path) -> HashSet<u64> {
 
 /// Encodes RGBX pixels as the cache format: magic, w, h (u16 LE), deflated RGB.
 pub fn encode(w: u32, h: u32, rgbx: &[u8]) -> Vec<u8> {
-    let rgb: Vec<u8> = rgbx.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let rgb: Vec<u8> = rgbx.as_chunks::<4>().0.iter().flat_map(|&[r, g, b, _]| [r, g, b]).collect();
     let mut out = Vec::with_capacity(8 + rgb.len() / 3);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(w as u16).to_le_bytes());
@@ -72,7 +72,7 @@ pub fn decode(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     if rgb.len() != n {
         return None;
     }
-    Some((w, h, rgb.chunks_exact(3).flat_map(|p| [p[0], p[1], p[2], 255]).collect()))
+    Some((w, h, rgb.as_chunks::<3>().0.iter().flat_map(|&[r, g, b]| [r, g, b, 255]).collect()))
 }
 
 pub fn load(dir: &Path, key: u64) -> Option<(u32, u32, Vec<u8>)> {
