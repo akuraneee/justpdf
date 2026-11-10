@@ -11,7 +11,8 @@
 //! Window size: JUSTPDF_HEADLESS_SIZE=WxH (default 1080x2340, density 2.75).
 //! Commands: shot:NAME, wait:MS, drag:DY, dragx:DX, fling:DY, tap:X,Y, dtap:X,Y,
 //! swipe:X,Y,DX,DY, pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle,
-//! nothing (launch with nothing to open), cancel (file picker cancelled)
+//! nothing (launch with nothing to open), cancel (file picker cancelled),
+//! down:X,Y / move:X,Y / up (a finger held down between commands, e.g. to shoot a drag)
 
 use std::io::Write;
 use std::sync::mpsc;
@@ -111,6 +112,8 @@ struct Harness {
     mock: Mock,
     start: Instant,
     touch_t: f64,
+    /// Where a finger put down with `down:` is.
+    finger: (f32, f32),
 }
 
 impl Harness {
@@ -222,7 +225,7 @@ fn main() {
     let mut app = App::new(DENSITY, Some(files), sink);
     app.resize(w, h);
     let mock = Mock { log: Vec::new(), tx };
-    let mut h = Harness { app, gpu, rx, mock, start: Instant::now(), touch_t: 100.0 };
+    let mut h = Harness { app, gpu, rx, mock, start: Instant::now(), touch_t: 100.0, finger: (0.0, 0.0) };
     let t = h.now();
     h.app.handle(Event::Insets([0.0, 66.0, 0.0, 44.0]), t, &mut h.mock);
 
@@ -260,6 +263,24 @@ fn main() {
             "dragx" => h.drag(cx, cy, nums[0], 0.0, 20, 16),
             "fling" => h.drag(cx, cy, 0.0, nums[0], 6, 8),
             "swipe" => h.drag(nums[0], nums[1], nums[2], nums[3], 20, 16),
+            "down" => {
+                h.finger = (nums[0], nums[1]);
+                h.touch(app::ACTION_DOWN, 0, &[h.finger]);
+            }
+            "move" => {
+                let (x0, y0) = h.finger;
+                for i in 1..=10 {
+                    let f = i as f32 / 10.0;
+                    std::thread::sleep(Duration::from_millis(16));
+                    h.touch(app::ACTION_MOVE, 0, &[(x0 + (nums[0] - x0) * f, y0 + (nums[1] - y0) * f)]);
+                }
+                h.finger = (nums[0], nums[1]);
+            }
+            "up" => {
+                let f = h.finger;
+                h.touch(app::ACTION_UP, 0, &[f]);
+                h.run_for(350);
+            }
             "tap" => {
                 h.tap(nums[0], nums[1]);
                 h.run_for(350);

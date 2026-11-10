@@ -25,9 +25,8 @@ pub enum Icon {
     Back,
     Up,
     Down,
-    /// Split view: a window divided in two side by side (`SplitRows`: one above the other).
-    Split,
-    SplitRows,
+    /// A cross (closes a tab).
+    Close,
     Caffeine,
     Pin,
     /// A document with a folded corner.
@@ -66,20 +65,12 @@ pub fn icon(p: &mut Painter, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgb
                 p.line(a, b, c, d, t, color);
             }
         }
-        Icon::Split => {
-            // A window divided in two halves.
-            let r = [(3.0, 5.0), (21.0, 5.0), (21.0, 19.0), (3.0, 19.0), (3.0, 5.0)];
-            p.polyline(&r.map(|(x, y)| pt(x, y)), t, color);
-            let (a, b) = pt(12.0, 5.0);
-            let (c, d) = pt(12.0, 19.0);
-            p.line(a, b, c, d, t, color);
-        }
-        Icon::SplitRows => {
-            let r = [(4.0, 3.0), (20.0, 3.0), (20.0, 21.0), (4.0, 21.0), (4.0, 3.0)];
-            p.polyline(&r.map(|(x, y)| pt(x, y)), t, color);
-            let (a, b) = pt(4.0, 12.0);
-            let (c, d) = pt(20.0, 12.0);
-            p.line(a, b, c, d, t, color);
+        Icon::Close => {
+            for (x0, x1) in [(6.0, 18.0), (18.0, 6.0)] {
+                let (a, b) = pt(x0, 6.0);
+                let (c, d) = pt(x1, 18.0);
+                p.line(a, b, c, d, t, color);
+            }
         }
         Icon::Caffeine => {
             // Coffee cup with a handle and two wisps of steam.

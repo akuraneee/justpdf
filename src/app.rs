@@ -5,7 +5,9 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 mod shelf;
+mod tabs;
 use shelf::{Covers, Shelf};
+use tabs::{Tab, TabAct};
 
 use crate::gesture::{Fling, VelocityTracker};
 use crate::gfx::{Gpu, Painter};
@@ -123,7 +125,6 @@ enum Hit {
     Next,
     Field,
     Indicator,
-    Split,
     Caffeine,
     Bar,
     ShelfBack,
@@ -193,6 +194,17 @@ enum Gesture {
         sx: f32,
         sy: f32,
         moved: bool,
+    },
+    /// Document tab strip (viewport coordinates): where the touch began, where
+    /// it is, the tab under it (on its close button?) and what it turned into.
+    Tabs {
+        sx: f32,
+        sy: f32,
+        x: f32,
+        y: f32,
+        tab: Option<usize>,
+        close: bool,
+        act: TabAct,
     },
     /// Library tab strip (scrolls sideways); `start`: x where the touch began.
     ShelfTabs {
@@ -288,6 +300,15 @@ struct Pane {
     worker: Worker,
     doc: Option<Doc>,
     pending: Option<Pending>,
+    /// Open documents; `tabs[tab]` is (or is becoming) `doc`.
+    tabs: Vec<Tab>,
+    tab: usize,
+    /// Scroll the tab strip to the active tab when it is drawn next.
+    tab_follow: bool,
+    tabs_scroll: f32,
+    tabs_max: f32,
+    /// Tab chips and their close buttons as last drawn (viewport coordinates).
+    chips: Vec<([f32; 4], [f32; 4])>,
 
     view: View,
     anim: Option<Anim>,
@@ -340,6 +361,12 @@ impl Pane {
             worker: Worker::new(sink),
             doc: None,
             pending: None,
+            tabs: Vec::new(),
+            tab: 0,
+            tab_follow: false,
+            tabs_scroll: 0.0,
+            tabs_max: 0.0,
+            chips: Vec::new(),
             view: View::default(),
             anim: None,
             fling: None,
@@ -408,8 +435,10 @@ pub struct App {
     other_busy: (bool, Option<f64>),
     /// Panes closed since the last frame: their tiles go with the next render.
     retired: Vec<Pane>,
-    /// The pane waiting for an answer from the file picker / `open_document`.
-    opener: Option<u64>,
+    /// Panes waiting for `open_document(uri)`: (uri, pane id).
+    openers: Vec<(String, u64)>,
+    /// The pane waiting for the file picker.
+    picker_for: Option<u64>,
 
     pointers: Vec<(i32, f32, f32)>,
     keyboard: bool,
@@ -483,7 +512,8 @@ impl App {
             other: None,
             other_busy: (false, None),
             retired: Vec::new(),
-            opener: None,
+            openers: Vec::new(),
+            picker_for: None,
             pointers: Vec::new(),
             keyboard: false,
             bars: None,
@@ -660,6 +690,15 @@ impl App {
         }
     }
 
+    /// Whether pane `id` exists and `f` holds for it.
+    fn pane_is(&self, id: u64, f: impl Fn(&Pane) -> bool) -> bool {
+        if self.pane.id == id {
+            f(&self.pane)
+        } else {
+            self.other.as_ref().is_some_and(|o| o.id == id && f(o))
+        }
+    }
+
     /// Gives the focus to the other pane (a touch started there).
     fn focus_other(&mut self, p: &mut dyn Platform) {
         self.pane.menu = false;
@@ -674,8 +713,13 @@ impl App {
     /// The window rect (x, y, w, h) and insets of the pane in `slot`. Split
     /// view divides the window along its longer side, with a thin divider.
     fn slot_rect(&self, slot: u8) -> ([f32; 4], [f32; 4]) {
+        self.slot_rect_in(slot, self.split())
+    }
+
+    /// `slot_rect` with or without split view.
+    fn slot_rect_in(&self, slot: u8, split: bool) -> ([f32; 4], [f32; 4]) {
         let (w, h, i) = (self.win_w, self.win_h, self.win_insets);
-        if !self.split() {
+        if !split {
             return ([0.0, 0.0, w, h], i);
         }
         let gap = self.divider();
@@ -721,30 +765,23 @@ impl App {
         }
     }
 
-    /// The split view button: opens a second pane next to this one, or closes
-    /// this pane when two are shown.
-    fn toggle_split(&mut self, p: &mut dyn Platform) {
-        if self.split() {
-            let id = self.pane.id;
-            return self.close_pane(id, p);
+    /// Opens the second pane of the split view (right / bottom), empty; the
+    /// focus stays where it is. Returns its id.
+    fn new_pane(&mut self) -> u64 {
+        if let Some(o) = &self.other {
+            return o.id;
         }
         self.save_position();
         let id = self.next_id;
         self.next_id += 1;
-        let tab = self.pane.shelf.tab;
         let mut shelf = Shelf::new(&self.library, "");
-        shelf.tab = tab;
+        shelf.tab = self.pane.shelf.tab;
         self.pane.slot = 0;
         self.pane.menu = false;
         self.other = Some(Box::new(Pane::new(id, 1, self.sink.clone(), shelf)));
-        // The new pane gets the focus and shows the library (or the file picker).
-        self.focus_other(p);
+        self.other_busy = (false, None);
         self.place_panes();
-        self.pane.overlay = true;
-        self.pane.overlay_until = self.now + OVERLAY_TIMEOUT;
-        if !self.home {
-            self.pick(p);
-        }
+        id
     }
 
     /// Closes pane `id`; the other one takes the whole window.
@@ -760,11 +797,18 @@ impl App {
         }
         self.save_position();
         self.pane.worker.close();
-        if self.opener == Some(id) {
-            self.opener = None;
+        self.openers.retain(|(_, pane)| *pane != id);
+        if self.picker_for == Some(id) {
+            self.picker_for = None;
         }
         let Some(rest) = self.other.take() else { return };
-        let closed = std::mem::replace(&mut self.pane, *rest);
+        let mut closed = std::mem::replace(&mut self.pane, *rest);
+        // Its other tabs stay open, in the pane that is left.
+        for t in std::mem::take(&mut closed.tabs) {
+            if !self.pane.tabs.iter().any(|x| x.uri == t.uri) {
+                self.pane.tabs.push(t);
+            }
+        }
         self.retired.push(closed);
         self.pane.slot = 0;
         self.place_panes();
@@ -773,14 +817,29 @@ impl App {
 
     /// Opens the file picker for the focused pane.
     fn pick(&mut self, p: &mut dyn Platform) {
-        self.opener = Some(self.pane.id);
+        self.picker_for = Some(self.pane.id);
         p.open_picker();
     }
 
     /// Opens `uri` in the focused pane.
     fn open_uri(&mut self, uri: &str, p: &mut dyn Platform) {
-        self.opener = Some(self.pane.id);
+        self.open_uri_in(self.pane.id, uri, p);
+    }
+
+    /// Opens `uri` in pane `id`.
+    fn open_uri_in(&mut self, id: u64, uri: &str, p: &mut dyn Platform) {
+        self.openers.push((uri.to_string(), id));
         p.open_document(uri);
+    }
+
+    /// The pane that asked for the document `uri` (answers come back by URI;
+    /// failures name it in their message); else the one that opened the picker.
+    fn opener_of(&mut self, uri: &str) -> Option<u64> {
+        let i = self.openers.iter().position(|(u, _)| uri == u || (!u.is_empty() && uri.ends_with(u.as_str())));
+        match i {
+            Some(i) => Some(self.openers.remove(i).1),
+            None => self.picker_for.take(),
+        }
     }
 
     // ----- geometry ---------------------------------------------------------------------
@@ -908,6 +967,10 @@ impl App {
     fn view_changed(&mut self) {
         self.pane.requests_dirty = true;
         self.dirty = true;
+    }
+
+    fn overlay_until_default(&self) -> f64 {
+        self.now + OVERLAY_TIMEOUT
     }
 
     fn touch_activity(&mut self) {
@@ -1114,31 +1177,34 @@ impl App {
                 }
             }
             Event::Open { fd, uri, name } => {
-                let opener = self.opener.take();
+                let opener = self.opener_of(&uri);
                 self.with_pane(opener, |a| a.open_fd(fd, uri, name, now, p));
             }
             Event::OpenFailed(msg) => {
                 crate::log_w!("open failed: {msg}");
-                let opener = self.opener.take();
+                let opener = self.opener_of(&msg);
                 self.with_pane(opener, |a| {
                     a.pane.shelf.opening = None;
                     a.toast("Can't open this file");
                 });
+                // A pane opened by dragging a tab over that could not open it: no pane.
+                let id = opener.unwrap_or(self.pane.id);
+                if self.split() && self.pane_is(id, |pn| pn.doc.is_none() && pn.pending.is_none() && pn.tabs.is_empty()) {
+                    self.close_pane(id, p);
+                }
                 if self.picker_home() {
                     self.pick(p);
                 }
             }
             Event::PickerCancelled => {
-                let opener = self.opener.take();
+                let opener = self.picker_for.take();
                 let empty = |pn: &Pane| pn.doc.is_none() && pn.pending.is_none();
                 if self.picker_home() {
                     p.exit();
                 } else if !self.home && self.split() {
                     // A new split pane without the library: no file chosen, no pane.
                     let id = opener.unwrap_or(self.pane.id);
-                    let gone =
-                        if self.pane.id == id { empty(&self.pane) } else { self.other.as_ref().is_some_and(|o| o.id == id && empty(o)) };
-                    if gone {
+                    if self.pane_is(id, empty) {
                         self.close_pane(id, p);
                     }
                 }
@@ -1214,6 +1280,7 @@ impl App {
                 let Some(pending) = self.pane.pending.take_if(|pd| pd.id == doc) else { return };
                 let restore = self.store.get(&pending.uri);
                 self.store.opened(&pending.uri, &pending.name, sizes.len() as u32);
+                self.add_tab(&pending.uri, &pending.name);
                 self.opened_cover(doc, &pending.uri);
                 self.pane.shelf.open = false;
                 self.pane.shelf.opening = None;
@@ -1544,6 +1611,7 @@ impl App {
             ACTION_CANCEL => {
                 self.pane.gesture = Gesture::None;
                 self.pane.vel.reset();
+                self.pane.overlay_until = self.overlay_until_default();
             }
             _ => {}
         }
@@ -1566,6 +1634,9 @@ impl App {
             return;
         }
         let controls = self.pane.overlay_t > 0.5 || self.pane.mode != Mode::Read;
+        if controls && self.tabs_down(x, y) {
+            return;
+        }
         if controls {
             if let Some(b) = self.pane.buttons.iter().rev().find(|b| inside(b.r, x, y)).copied() {
                 self.pane.gesture = Gesture::Button { hit: b.hit, r: b.r, inside: true };
@@ -1680,6 +1751,11 @@ impl App {
                 };
                 self.pane.gesture = Gesture::PanelResize { w, grab, moved };
             }
+            Gesture::Tabs { .. } => {
+                if let Some(&(_, cx, cy)) = self.pointers.first() {
+                    self.tabs_move(cx, cy);
+                }
+            }
             Gesture::PanelOutside | Gesture::Shelf { .. } | Gesture::ShelfTabs { .. } | Gesture::None => {}
         }
     }
@@ -1754,6 +1830,7 @@ impl App {
                     self.with_other(|a| a.update_dock(a.pane.vh));
                 }
             }
+            g @ Gesture::Tabs { .. } => self.tabs_up(g, p),
             Gesture::Shelf { .. } | Gesture::ShelfTabs { .. } | Gesture::None => {}
         }
     }
@@ -1798,7 +1875,6 @@ impl App {
                 }
             }
             Hit::MenuSpread => self.toggle_spread(),
-            Hit::Split => self.toggle_split(p),
             Hit::Caffeine => {
                 self.caffeine = !self.caffeine;
                 self.store.set_caffeine(self.caffeine);
@@ -2246,6 +2322,12 @@ impl App {
             let atlas = self.text.flush(gpu);
             gpu.draw_ui(&p.v, atlas);
         }
+        let mut p = Painter::default();
+        self.draw_tab_drag(&mut p);
+        if !p.v.is_empty() {
+            let atlas = self.text.flush(gpu);
+            gpu.draw_ui(&p.v, atlas);
+        }
     }
 
     /// Draws the focused pane (clipped to its rect).
@@ -2360,7 +2442,6 @@ impl App {
         }
         let on = match hit {
             Hit::Chapters => self.docked(),
-            Hit::Split => self.split(),
             Hit::Caffeine => self.caffeine,
             Hit::Settings => self.pane.menu,
             _ => false,
@@ -2412,7 +2493,7 @@ impl App {
             let top = self.pane.insets[1];
             p.rect(0.0, 0.0, vw, self.bar_bottom(), fade(ui::BAR, a), 0.0);
             if a > 0.5 {
-                self.pane.buttons.push(Button { r: [0.0, 0.0, vw, self.bar_bottom()], hit: Hit::Bar });
+                self.pane.buttons.push(Button { r: [0.0, 0.0, vw, self.overlay_bottom()], hit: Hit::Bar });
             }
             let cy = top + self.bar_h() / 2.0;
             let left = (self.pane.insets[0] - self.pane.ox).max(0.0) + self.dp(4.0);
@@ -2431,13 +2512,6 @@ impl App {
                         }
                         rx -= b;
                         self.icon_button(p, Icon::Search, rx, cy, Hit::Search, a);
-                    }
-                    if self.pane.doc.is_some() || self.split() {
-                        rx -= b;
-                        let icon = if self.win_w >= self.win_h { Icon::Split } else { Icon::SplitRows };
-                        self.icon_button(p, icon, rx, cy, Hit::Split, a);
-                    }
-                    if self.pane.doc.is_some() {
                         rx -= b;
                         self.icon_button(p, Icon::Caffeine, rx, cy, Hit::Caffeine, a);
                     }
@@ -2450,6 +2524,9 @@ impl App {
                     let tx = left + b + self.dp(8.0);
                     let baseline = cy + self.text.cap_height(px) / 2.0;
                     self.text.draw(p, &title, tx, baseline, px, fade(ui::FG, a), (rx - self.dp(8.0) - tx).max(0.0));
+                    if self.tabs_shown() {
+                        self.draw_tabs(p, a);
+                    }
                 }
                 Mode::Search => {
                     self.icon_button(p, Icon::Back, left, cy, Hit::Close, a);
