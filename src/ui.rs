@@ -27,6 +27,8 @@ pub enum Icon {
     Down,
     /// A cross (closes a tab).
     Close,
+    /// Plus sign (new tab).
+    Plus,
     Caffeine,
     Pin,
     /// A document with a folded corner.
@@ -64,6 +66,14 @@ pub fn icon(p: &mut Painter, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgb
                 let (c, d) = pt(20.0, y);
                 p.line(a, b, c, d, t, color);
             }
+        }
+        Icon::Plus => {
+            let (a, b) = pt(12.0, 5.0);
+            let (c, d) = pt(12.0, 19.0);
+            p.line(a, b, c, d, t, color);
+            let (a, b) = pt(5.0, 12.0);
+            let (c, d) = pt(19.0, 12.0);
+            p.line(a, b, c, d, t, color);
         }
         Icon::Close => {
             for (x0, x1) in [(6.0, 18.0), (18.0, 6.0)] {

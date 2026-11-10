@@ -136,6 +136,8 @@ enum Hit {
     MenuHome,
     /// The "two pages side by side" row of the settings menu.
     MenuSpread,
+    /// The "+" at the end of the tab strip.
+    NewTab,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -307,8 +309,9 @@ struct Pane {
     tab_follow: bool,
     tabs_scroll: f32,
     tabs_max: f32,
-    /// Tab chips and their close buttons as last drawn (viewport coordinates).
+    /// Tab chips and their close buttons, and the "+", as last drawn (viewport coordinates).
     chips: Vec<([f32; 4], [f32; 4])>,
+    plus: [f32; 4],
 
     view: View,
     anim: Option<Anim>,
@@ -367,6 +370,7 @@ impl Pane {
             tabs_scroll: 0.0,
             tabs_max: 0.0,
             chips: Vec::new(),
+            plus: [0.0; 4],
             view: View::default(),
             anim: None,
             fling: None,
@@ -1875,6 +1879,7 @@ impl App {
                 }
             }
             Hit::MenuSpread => self.toggle_spread(),
+            Hit::NewTab => self.new_tab(p),
             Hit::Caffeine => {
                 self.caffeine = !self.caffeine;
                 self.store.set_caffeine(self.caffeine);

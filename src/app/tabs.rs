@@ -172,6 +172,15 @@ impl App {
             return false;
         }
         let pad = self.dp(4.0);
+        let plus = self.pane.plus;
+        if inside([plus[0] - pad, plus[1] - pad, plus[2] + 2.0 * pad, plus[3] + 2.0 * pad], x, y) {
+            self.pane.gesture = Gesture::Button {
+                hit: Hit::NewTab,
+                r: [plus[0] - pad, self.tabs_rect()[1], plus[2] + 2.0 * pad, self.tabs_h()],
+                inside: true,
+            };
+            return true;
+        }
         let hit = self.pane.chips.iter().position(|(r, _)| inside([r[0], r[1] - pad, r[2], r[3] + 2.0 * pad], x, y));
         let close = hit.is_some_and(|i| {
             let c = self.pane.chips[i].1;
@@ -230,7 +239,10 @@ impl App {
         let (tpx, cs) = (self.dp(14.0), self.dp(16.0));
         let y = r[1] + (r[3] - h) / 2.0;
         let x0 = (self.pane.insets[0] - self.pane.ox).max(0.0) + self.dp(8.0);
-        let right = r[2] - self.pane.insets[2] - self.dp(8.0);
+        let edge = r[2] - self.pane.insets[2] - self.dp(8.0);
+        // The "+" follows the last tab, and stays at the right end when the tabs overflow.
+        let plus_w = self.dp(44.0);
+        let right = edge - plus_w - gap;
         let dragged = match self.pane.gesture {
             Gesture::Tabs { tab, act: TabAct::Drag, .. } => tab,
             _ => None,
@@ -283,6 +295,28 @@ impl App {
             ui::icon(p, Icon::Close, c[0] + cs / 2.0, c[1] + cs / 2.0, cs, fade(ui::DIM, k));
             self.pane.chips.push(([x, y, w, h], c));
             x += w + gap;
+        }
+        let px = x.min(edge - plus_w);
+        if px < x {
+            // Tabs scrolled under the "+": cover them.
+            p.rect(px - gap, r[1], r[0] + r[2] - (px - gap), r[3] - 1.0, fade(ui::BAR, a), 0.0);
+        }
+        let plus = [px, y, plus_w, h];
+        p.rect(plus[0], plus[1], plus[2], plus[3], fade(ui::FIELD, a), h / 2.0);
+        if matches!(self.pane.gesture, Gesture::Button { hit: Hit::NewTab, inside: true, .. }) {
+            p.rect(plus[0], plus[1], plus[2], plus[3], fade(ui::PRESS, a), h / 2.0);
+        }
+        ui::icon(p, Icon::Plus, px + plus_w / 2.0, y + h / 2.0, self.dp(20.0), fade(ui::FG, a));
+        self.pane.plus = plus;
+    }
+
+    /// The "+" of the tab strip: pick another document for a new tab (the
+    /// library, or the file picker without it).
+    pub(super) fn new_tab(&mut self, p: &mut dyn Platform) {
+        if self.home {
+            self.show_shelf(p);
+        } else {
+            self.pick(p);
         }
     }
 
