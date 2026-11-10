@@ -1,14 +1,17 @@
 //! The PDF worker thread. Owns every PDFium object and serves a priority
-//! queue: control jobs, then visible tiles, then search steps, then prefetch.
+//! queue: control jobs, then visible tiles, then library covers, then search
+//! steps, then prefetch.
 //!
 //! The app replaces the whole render queue whenever the view changes, so
 //! requests for tiles that scrolled away simply disappear.
 
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use crate::covers;
 use crate::pdfium::{self, Document, OpenError, OutlineItem};
 use crate::search::{self, PageText};
 use crate::tiles::TileKey;
@@ -63,6 +66,44 @@ pub enum Msg {
         scanned: u32,
         total: u32,
     },
+    /// A library cover (RGBA), loaded from the disk cache or freshly rendered
+    /// (and then cached).
+    Cover {
+        key: u64,
+        w: u32,
+        h: u32,
+        pixels: Vec<u8>,
+    },
+    /// The cover could not be made; `missing`: it was asked from the disk cache
+    /// but is not there (any more).
+    CoverFailed {
+        key: u64,
+        missing: bool,
+    },
+}
+
+/// Where a cover comes from. Every job answers with `Msg::Cover` or `Msg::CoverFailed`.
+pub enum CoverSrc {
+    /// The disk cache.
+    Disk,
+    /// The first page of the document behind `fd` (ownership is taken).
+    Fd(i32),
+    /// The first page of the open document `doc`.
+    Doc(u64),
+}
+
+struct CoverJob {
+    key: u64,
+    src: CoverSrc,
+    dir: PathBuf,
+}
+
+impl Drop for CoverJob {
+    fn drop(&mut self) {
+        if let CoverSrc::Fd(fd) = std::mem::replace(&mut self.src, CoverSrc::Disk) {
+            drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+    }
 }
 
 enum Ctrl {
@@ -87,6 +128,7 @@ struct Queue {
     doc: u64,
     render: VecDeque<RenderReq>,
     search: Option<SearchJob>,
+    covers: VecDeque<CoverJob>,
     pool: Vec<Vec<u8>>,
 }
 
@@ -160,6 +202,11 @@ impl Worker {
         });
     }
 
+    /// Asks for the cover `key` (cached in `dir`).
+    pub fn cover(&self, key: u64, src: CoverSrc, dir: PathBuf) {
+        self.with(|q| q.covers.push_back(CoverJob { key, src, dir }));
+    }
+
     pub fn cancel_search(&self) {
         self.with(|q| q.search = None);
     }
@@ -186,6 +233,7 @@ enum Job {
     Ctrl(Ctrl),
     Render(u64, RenderReq, Vec<u8>),
     Search { doc: u64, gen: u64, query: Arc<Vec<char>>, page: u32, last: bool, scanned: u32, total: u32 },
+    Cover(CoverJob),
 }
 
 fn next_job(shared: &Shared) -> Option<Job> {
@@ -199,6 +247,9 @@ fn next_job(shared: &Shared) -> Option<Job> {
         }
         let urgent = q.render.front().is_some_and(|r| r.urgent);
         if !urgent {
+            if let Some(c) = q.covers.pop_front() {
+                return Some(Job::Cover(c));
+            }
             if let Some(s) = q.search.as_mut() {
                 let page = s.next;
                 s.next = (s.next + 1) % s.total.max(1);
@@ -226,14 +277,24 @@ struct State {
     /// A document waiting for a password.
     pending: Option<(u64, OwnedFd)>,
     texts: HashMap<u32, PageText>,
+    /// Covers written since the disk cache was last pruned.
+    written: u32,
 }
 
 fn run(shared: Arc<Shared>, sink: Sink) {
     if let Err(e) = pdfium::init() {
         crate::log_e!("pdfium init failed: {e}");
     }
-    let mut st = State { sink, cur: None, pending: None, texts: HashMap::new() };
+    let mut st = State { sink, cur: None, pending: None, texts: HashMap::new(), written: 0 };
     while let Some(job) = next_job(&shared) {
+        if let Job::Cover(CoverJob { key, src: CoverSrc::Disk, dir }) = &job {
+            // Plain file I/O: no PDFium lock needed.
+            match covers::load(dir, *key) {
+                Some((w, h, pixels)) => (st.sink)(Msg::Cover { key: *key, w, h, pixels }),
+                None => (st.sink)(Msg::CoverFailed { key: *key, missing: true }),
+            }
+            continue;
+        }
         let _guard = pdfium::LOCK.lock().unwrap_or_else(|e| e.into_inner());
         match job {
             Job::Ctrl(Ctrl::Open { doc, fd }) => {
@@ -272,6 +333,7 @@ fn run(shared: Arc<Shared>, sink: Sink) {
                     (st.sink)(Msg::SearchProgress { doc, gen, scanned, total });
                 }
             }
+            Job::Cover(job) => make_cover(&mut st, job),
         }
     }
     let _guard = pdfium::LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -297,6 +359,40 @@ fn try_open(st: &mut State, doc: u64, fd: OwnedFd, password: Option<&str>) {
             (st.sink)(Msg::OpenFailed { doc, error });
         }
     }
+}
+
+/// Renders the first page of a document as a cover, caches it and sends it.
+fn make_cover(st: &mut State, mut job: CoverJob) {
+    let key = job.key;
+    let pixels = match std::mem::replace(&mut job.src, CoverSrc::Disk) {
+        CoverSrc::Disk => None,
+        CoverSrc::Fd(fd) => {
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            Document::open(fd.as_raw_fd(), None).ok().and_then(|mut d| render_cover(&mut d))
+        }
+        CoverSrc::Doc(doc) => match st.cur.as_mut() {
+            Some((id, d, _)) if *id == doc => render_cover(d),
+            _ => None,
+        },
+    };
+    match pixels {
+        Some((w, h, px)) => {
+            covers::save(&job.dir, key, w, h, &px);
+            st.written += 1;
+            if st.written % 32 == 1 {
+                covers::prune(&job.dir);
+            }
+            (st.sink)(Msg::Cover { key, w, h, pixels: px });
+        }
+        None => (st.sink)(Msg::CoverFailed { key, missing: false }),
+    }
+}
+
+fn render_cover(d: &mut Document) -> Option<(u32, u32, Vec<u8>)> {
+    let &(pw, ph) = d.sizes().first()?;
+    let (page_w, page_h, h) = covers::dims(pw, ph);
+    let mut px = Vec::new();
+    d.render(0, page_w, page_h, 0, 0, page_w, h, &mut px).then_some((page_w, h, px))
 }
 
 fn search_page(st: &mut State, doc: u64, gen: u64, query: &[char], page: u32) {

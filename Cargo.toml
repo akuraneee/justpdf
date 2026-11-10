@@ -16,6 +16,7 @@ headless = []
 [dependencies]
 ab_glyph = "0.2"
 libc = "0.2"
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"

@@ -111,11 +111,49 @@ impl Jni {
             let _ = env.exception_clear();
         }
     }
+
+    /// Calls `name(String)` (or `name(long, String)` with a `key`).
+    fn call_str(&self, name: &str, key: Option<i64>, s: &str) {
+        let Ok(mut env) = self.vm.get_env() else { return };
+        let activity = self.activity.as_obj();
+        let _ = env.with_local_frame(8, |env| -> jni::errors::Result<()> {
+            let js = env.new_string(s)?;
+            match key {
+                Some(k) => env.call_method(activity, name, "(JLjava/lang/String;)V", &[JValue::Long(k), JValue::Object(&js)])?,
+                None => env.call_method(activity, name, "(Ljava/lang/String;)V", &[JValue::Object(&js)])?,
+            };
+            Ok(())
+        });
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_describe();
+            let _ = env.exception_clear();
+        }
+    }
 }
 
 impl Platform for Jni {
     fn open_picker(&mut self) {
         self.call("openPicker", "()V", &[]);
+    }
+
+    fn open_folder_picker(&mut self) {
+        self.call("openFolderPicker", "()V", &[]);
+    }
+
+    fn scan_folder(&mut self, uri: &str) {
+        self.call_str("scanFolder", None, uri);
+    }
+
+    fn release_folder(&mut self, uri: &str) {
+        self.call_str("releaseFolder", None, uri);
+    }
+
+    fn open_document(&mut self, uri: &str) {
+        self.call_str("openDocument", None, uri);
+    }
+
+    fn open_cover(&mut self, key: u64, uri: &str) {
+        self.call_str("openCover", Some(key as i64), uri);
     }
 
     fn show_keyboard(&mut self, mode: i32, text: &str) {
@@ -456,6 +494,55 @@ pub extern "system" fn Java_dev_justpdf_MainActivity_nativeOpenFailed<'l>(
 #[no_mangle]
 pub extern "system" fn Java_dev_justpdf_MainActivity_nativePickerCancelled(_env: JNIEnv, _class: JClass, h: jlong) {
     send(h, Cmd::App(Event::PickerCancelled));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_justpdf_MainActivity_nativeFolderPicked<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    h: jlong,
+    uri: JString<'l>,
+    name: JString<'l>,
+) {
+    let uri = jstr(&mut env, &uri);
+    let name = jstr(&mut env, &name);
+    send(h, Cmd::App(Event::FolderPicked { uri, name }));
+}
+
+/// `list`: one "folder path \t file name \t document URI" line per PDF.
+#[no_mangle]
+pub extern "system" fn Java_dev_justpdf_MainActivity_nativeFolderScanned<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    h: jlong,
+    uri: JString<'l>,
+    list: JString<'l>,
+    ok: jboolean,
+) {
+    let uri = jstr(&mut env, &uri);
+    let list = jstr(&mut env, &list);
+    let books = list
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            let (dir, name, uri) = (f.next()?, f.next()?, f.next()?);
+            (!uri.is_empty()).then(|| (dir.to_string(), name.to_string(), uri.to_string()))
+        })
+        .collect();
+    send(h, Cmd::App(Event::FolderScanned { uri, books, ok: ok != JNI_FALSE }));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_justpdf_MainActivity_nativeCoverFd(_env: JNIEnv, _class: JClass, h: jlong, key: jlong, fd: jint) {
+    match handle(h) {
+        Some(handle) => {
+            let _ = handle.tx.send(Cmd::App(Event::CoverFd { key: key as u64, fd }));
+        }
+        None if fd >= 0 => unsafe {
+            libc::close(fd);
+        },
+        None => {}
+    }
 }
 
 #[no_mangle]

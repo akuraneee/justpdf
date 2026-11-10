@@ -4,6 +4,10 @@
 //! cargo run --release --features headless --example headless -- file.pdf out_dir \
 //!     shot:open drag:-2000 wait:500 shot:scrolled tap:540,1200 ...
 //!
+//! With a directory instead of a PDF the app starts in its library with that
+//! directory added as a library folder (fresh settings each run); the mock
+//! platform answers scans, opens and cover requests from the file system.
+//!
 //! Window size: JUSTPDF_HEADLESS_SIZE=WxH (default 1080x2340, density 2.75).
 //! Commands: shot:NAME, wait:MS, drag:DY, dragx:DX, fling:DY, tap:X,Y, dtap:X,Y,
 //! swipe:X,Y,DX,DY, pinch:X,Y,FACTOR, text:STRING, ime, back, key:CODE, idle
@@ -26,14 +30,61 @@ fn size() -> (u32, u32) {
         .unwrap_or((1080, 2340))
 }
 
-#[derive(Default)]
 struct Mock {
     log: Vec<String>,
+    tx: mpsc::Sender<Event>,
+}
+
+fn open_path(uri: &str) -> Option<i32> {
+    let c = std::ffi::CString::new(uri.strip_prefix("file://")?).ok()?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    (fd >= 0).then_some(fd)
+}
+
+/// PDFs under `dir`: (folder path relative to `root`, file name, file:// URI).
+fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String, String)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk(root, &p, out);
+        } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("pdf")) {
+            let rel = dir.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            out.push((rel, e.file_name().to_string_lossy().into_owned(), format!("file://{}", p.display())));
+        }
+    }
 }
 
 impl Platform for Mock {
     fn open_picker(&mut self) {
         self.log.push("open_picker".into());
+    }
+    fn open_folder_picker(&mut self) {
+        self.log.push("open_folder_picker".into());
+    }
+    fn scan_folder(&mut self, uri: &str) {
+        self.log.push(format!("scan_folder({uri})"));
+        let root = std::path::PathBuf::from(uri.strip_prefix("file://").unwrap_or(uri));
+        let mut books = Vec::new();
+        walk(&root, &root, &mut books);
+        let _ = self.tx.send(Event::FolderScanned { uri: uri.to_string(), books, ok: root.is_dir() });
+    }
+    fn release_folder(&mut self, uri: &str) {
+        self.log.push(format!("release_folder({uri})"));
+    }
+    fn open_document(&mut self, uri: &str) {
+        self.log.push(format!("open_document({uri})"));
+        let ev = match open_path(uri) {
+            Some(fd) => {
+                let name = uri.rsplit('/').next().unwrap_or("Document").to_string();
+                Event::Open { fd, uri: uri.to_string(), name }
+            }
+            None => Event::OpenFailed(uri.to_string()),
+        };
+        let _ = self.tx.send(ev);
+    }
+    fn open_cover(&mut self, key: u64, uri: &str) {
+        let _ = self.tx.send(Event::CoverFd { key, fd: open_path(uri).unwrap_or(-1) });
     }
     fn show_keyboard(&mut self, mode: i32, text: &str) {
         self.log.push(format!("show_keyboard({mode}, {text:?})"));
@@ -161,28 +212,38 @@ fn main() {
     let sink = Box::new(move |m| {
         let _ = sink_tx.lock().unwrap().send(Event::Worker(m));
     });
-    let files = std::env::temp_dir().join("justpdf-headless");
+    let library = std::path::Path::new(pdf).is_dir();
+    let files = std::env::temp_dir().join(if library { "justpdf-headless-lib" } else { "justpdf-headless" });
+    if library {
+        let _ = std::fs::remove_dir_all(&files);
+    }
     std::fs::create_dir_all(&files).unwrap();
     let mut app = App::new(DENSITY, Some(files), sink);
     app.resize(w, h);
-    let mut h = Harness { app, gpu, rx, mock: Mock::default(), start: Instant::now(), touch_t: 100.0 };
+    let mock = Mock { log: Vec::new(), tx };
+    let mut h = Harness { app, gpu, rx, mock, start: Instant::now(), touch_t: 100.0 };
     let t = h.now();
     h.app.handle(Event::Insets([0.0, 66.0, 0.0, 44.0]), t, &mut h.mock);
 
-    let cpath = std::ffi::CString::new(pdf.as_str()).unwrap();
-    let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    assert!(fd >= 0, "cannot open {pdf}");
-    let name = std::path::Path::new(pdf).file_name().unwrap().to_string_lossy().into_owned();
-    let t = h.now();
-    h.app.handle(Event::Open { fd, uri: format!("file://{pdf}"), name }, t, &mut h.mock);
-    let t0 = Instant::now();
-    while !h.app.has_document() && t0.elapsed() < Duration::from_secs(10) {
+    if library {
+        let path = std::fs::canonicalize(pdf).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let t = h.now();
+        h.app.handle(Event::FolderPicked { uri: format!("file://{}", path.display()), name }, t, &mut h.mock);
+        h.settle();
+    } else {
+        let t = h.now();
+        h.mock.open_document(&format!("file://{pdf}"));
+        let t0 = Instant::now();
         h.pump();
-        std::thread::sleep(Duration::from_millis(2));
+        while !h.app.has_document() && t0.elapsed() < Duration::from_secs(10) {
+            h.pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        println!("opened in {:?} (t={t:.3})", t0.elapsed());
+        h.settle();
+        println!("first screen settled in {:?}: {}", t0.elapsed(), h.app.stats());
     }
-    println!("opened in {:?}", t0.elapsed());
-    h.settle();
-    println!("first screen settled in {:?}: {}", t0.elapsed(), h.app.stats());
 
     for cmd in &args[3..] {
         let (op, arg) = cmd.split_once(':').unwrap_or((cmd.as_str(), ""));

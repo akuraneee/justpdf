@@ -6,10 +6,11 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use justpdf::covers;
 use justpdf::pdfium::{self, Document};
 use justpdf::search;
 use justpdf::tiles::TileKey;
-use justpdf::worker::{Msg, RenderReq, Worker};
+use justpdf::worker::{CoverSrc, Msg, RenderReq, Worker};
 
 fn test_pdf() -> Option<String> {
     let pdf = std::env::var("JUSTPDF_TEST_PDF").ok()?;
@@ -100,4 +101,51 @@ fn worker_round_trip() {
         }
     }
     assert_eq!(hits, 2);
+}
+
+#[test]
+fn worker_covers() {
+    let Some(path) = test_pdf() else { return eprintln!("skipped: PDFIUM_PATH/JUSTPDF_TEST_PDF not set") };
+    let dir = std::env::temp_dir().join(format!("justpdf-covers-it-{}", std::process::id()));
+    let (tx, rx) = mpsc::channel();
+    let tx = std::sync::Mutex::new(tx);
+    let worker = Worker::new(Box::new(move |m| {
+        let _ = tx.lock().unwrap().send(m);
+    }));
+    let next = || rx.recv_timeout(Duration::from_secs(10)).expect("worker reply");
+
+    // Not cached yet.
+    worker.cover(1, CoverSrc::Disk, dir.clone());
+    assert!(matches!(next(), Msg::CoverFailed { key: 1, missing: true }));
+
+    // Rendered from a file descriptor (first page is A4: 300 x 425), then cached.
+    worker.cover(1, CoverSrc::Fd(open_fd(&path)), dir.clone());
+    let first = match next() {
+        Msg::Cover { key: 1, w, h, pixels } => {
+            assert_eq!((w, h, pixels.len()), (300, 425, 300 * 425 * 4));
+            assert!(pixels.chunks(4).filter(|p| p[0] < 128).count() > 100, "expected text pixels");
+            pixels
+        }
+        m => panic!("unexpected {m:?}"),
+    };
+    assert!(covers::index(&dir).contains(&1));
+    worker.cover(1, CoverSrc::Disk, dir.clone());
+    match next() {
+        Msg::Cover { key: 1, w: 300, h: 425, pixels } => {
+            assert!(first.chunks(4).zip(pixels.chunks(4)).all(|(a, b)| a[..3] == b[..3]));
+        }
+        m => panic!("unexpected {m:?}"),
+    }
+
+    // From the open document; a broken fd fails cleanly.
+    worker.open(3, open_fd(&path));
+    assert!(matches!(next(), Msg::Opened { doc: 3, .. }));
+    assert!(matches!(next(), Msg::Outline { doc: 3, .. }));
+    worker.cover(2, CoverSrc::Doc(3), dir.clone());
+    assert!(matches!(next(), Msg::Cover { key: 2, w: 300, h: 425, .. }));
+    worker.cover(4, CoverSrc::Doc(99), dir.clone());
+    assert!(matches!(next(), Msg::CoverFailed { key: 4, missing: false }));
+    worker.cover(5, CoverSrc::Fd(open_fd("/dev/null")), dir.clone());
+    assert!(matches!(next(), Msg::CoverFailed { key: 5, missing: false }));
+    std::fs::remove_dir_all(dir).unwrap();
 }

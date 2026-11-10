@@ -1,4 +1,5 @@
-//! Remembers the reading position per document URI in a small text file.
+//! Remembers the reading position (plus name and page count, for the library's
+//! recent list) per document URI in a small text file, and the settings.
 
 use std::path::PathBuf;
 
@@ -14,6 +15,17 @@ pub struct Position {
 
 const MAX_ENTRIES: usize = 500;
 
+/// A document opened before, most recent first in `Store::recent`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub uri: String,
+    pub pos: Position,
+    /// Display name ("" if unknown: written by an older version).
+    pub name: String,
+    /// Page count (0 if unknown).
+    pub pages: u32,
+}
+
 pub struct Store {
     path: Option<PathBuf>,
     settings: Option<PathBuf>,
@@ -22,8 +34,10 @@ pub struct Store {
     pin_chapters: bool,
     /// Docked contents panel width in dp; 0 = automatic.
     chapters_w: u32,
+    /// Library tab last shown: "" = recent, else a folder's tree URI.
+    shelf: String,
     /// Most recent first.
-    entries: Vec<(String, Position)>,
+    entries: Vec<Entry>,
     dirty: bool,
 }
 
@@ -33,19 +47,16 @@ impl Store {
         let text = settings.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
         let flag = |key: &str| text.lines().filter_map(|l| l.trim().split_once('=')).any(|(k, v)| k == key && v == "1");
         let (spread, caffeine, pin_chapters) = (flag("spread"), flag("caffeine"), flag("pin_chapters"));
-        let chapters_w = text
-            .lines()
-            .filter_map(|l| l.trim().split_once('='))
-            .find(|(k, _)| *k == "chapters_w")
-            .and_then(|(_, v)| v.parse().ok())
-            .unwrap_or(0);
+        let value = |key: &str| text.lines().filter_map(|l| l.trim().split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| v);
+        let chapters_w = value("chapters_w").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let shelf = value("shelf").unwrap_or("").to_string();
         let path = dir.map(|d| d.join("positions.tsv"));
         let entries = path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .map(|s| s.lines().filter_map(parse_line).collect())
             .unwrap_or_default();
-        Store { path, settings, spread, caffeine, pin_chapters, chapters_w, entries, dirty: false }
+        Store { path, settings, spread, caffeine, pin_chapters, chapters_w, shelf, entries, dirty: false }
     }
 
     /// Two-page spread mode (a global preference).
@@ -88,28 +99,78 @@ impl Store {
         self.save_settings();
     }
 
+    /// Library tab last shown: "" = recent, else a folder's tree URI.
+    pub fn shelf(&self) -> &str {
+        &self.shelf
+    }
+
+    pub fn set_shelf(&mut self, tab: &str) {
+        if self.shelf != tab {
+            self.shelf = tab.replace(['\n', '\r'], "");
+            self.save_settings();
+        }
+    }
+
     fn save_settings(&self) {
         if let Some(p) = &self.settings {
             let s = format!(
-                "spread={}\ncaffeine={}\npin_chapters={}\nchapters_w={}\n",
-                self.spread as u8, self.caffeine as u8, self.pin_chapters as u8, self.chapters_w
+                "spread={}\ncaffeine={}\npin_chapters={}\nchapters_w={}\nshelf={}\n",
+                self.spread as u8, self.caffeine as u8, self.pin_chapters as u8, self.chapters_w, self.shelf
             );
             let _ = std::fs::write(p, s);
         }
     }
 
     pub fn get(&self, uri: &str) -> Option<Position> {
-        self.entries.iter().find(|(u, _)| u == uri).map(|(_, p)| *p)
+        self.entry(uri).map(|e| e.pos)
+    }
+
+    pub fn entry(&self, uri: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| e.uri == uri)
+    }
+
+    /// Documents opened before, most recent first.
+    pub fn recent(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Moves `uri` to the front, creating it if new; returns its entry.
+    fn front(&mut self, uri: &str) -> &mut Entry {
+        match self.entries.iter().position(|e| e.uri == uri) {
+            Some(0) => {}
+            Some(i) => {
+                let e = self.entries.remove(i);
+                self.entries.insert(0, e);
+            }
+            None => {
+                let pos = Position { page: 0, frac: 0.0, zoom: 1.0, x: 0.0 };
+                self.entries.insert(0, Entry { uri: uri.to_string(), pos, name: String::new(), pages: 0 });
+                self.entries.truncate(MAX_ENTRIES);
+            }
+        }
+        self.dirty = true;
+        &mut self.entries[0]
     }
 
     pub fn set(&mut self, uri: &str, pos: Position) {
-        if self.entries.first().is_some_and(|(u, p)| u == uri && *p == pos) {
+        if self.entries.first().is_some_and(|e| e.uri == uri && e.pos == pos) {
             return;
         }
-        self.entries.retain(|(u, _)| u != uri);
-        self.entries.insert(0, (uri.to_string(), pos));
-        self.entries.truncate(MAX_ENTRIES);
-        self.dirty = true;
+        self.front(uri).pos = pos;
+    }
+
+    /// Records that `uri` was just opened: it becomes the most recent document.
+    pub fn opened(&mut self, uri: &str, name: &str, pages: u32) {
+        let e = self.front(uri);
+        e.name = name.replace(['\t', '\n', '\r'], " ");
+        e.pages = pages;
+    }
+
+    /// Forgets a document (it is no longer listed as recent).
+    pub fn remove(&mut self, uri: &str) {
+        let n = self.entries.len();
+        self.entries.retain(|e| e.uri != uri);
+        self.dirty |= self.entries.len() != n;
     }
 
     pub fn save(&mut self) {
@@ -118,8 +179,9 @@ impl Store {
         }
         let Some(path) = &self.path else { return };
         let mut out = String::new();
-        for (uri, p) in &self.entries {
-            out.push_str(&format!("{}\t{:.6}\t{:.4}\t{:.6}\t{}\n", p.page, p.frac, p.zoom, p.x, uri));
+        for e in &self.entries {
+            let p = e.pos;
+            out.push_str(&format!("{}\t{:.6}\t{:.4}\t{:.6}\t{}\t{}\t{}\n", p.page, p.frac, p.zoom, p.x, e.uri, e.name, e.pages));
         }
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, out).and_then(|_| std::fs::rename(&tmp, path)).is_ok() {
@@ -128,14 +190,22 @@ impl Store {
     }
 }
 
-fn parse_line(line: &str) -> Option<(String, Position)> {
-    let mut it = line.splitn(5, '\t');
+/// `page frac zoom x uri [name pages]` (older versions wrote no name/pages).
+fn parse_line(line: &str) -> Option<Entry> {
+    let mut it = line.split('\t');
     let page = it.next()?.parse().ok()?;
     let frac: f64 = it.next()?.parse().ok()?;
     let zoom: f64 = it.next()?.parse().ok()?;
     let x: f64 = it.next()?.parse().ok()?;
     let uri = it.next()?.to_string();
-    (frac.is_finite() && zoom.is_finite() && x.is_finite() && !uri.is_empty()).then_some((uri, Position { page, frac, zoom, x }))
+    let name = it.next().unwrap_or("").to_string();
+    let pages = it.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (frac.is_finite() && zoom.is_finite() && x.is_finite() && !uri.is_empty()).then_some(Entry {
+        uri,
+        pos: Position { page, frac, zoom, x },
+        name,
+        pages,
+    })
 }
 
 #[cfg(test)]
@@ -153,7 +223,7 @@ mod tests {
         s.save();
         let s2 = Store::load(Some(dir.clone()));
         assert_eq!(s2.get("content://a/b%20c"), Some(p));
-        assert_eq!(s2.entries[0].0, "content://other");
+        assert_eq!(s2.entries[0].uri, "content://other");
         assert!(!s2.spread());
         let mut s3 = Store::load(Some(dir.clone()));
         s3.set_spread(true);
@@ -174,6 +244,23 @@ mod tests {
         let s7 = Store::load(Some(dir.clone()));
         assert_eq!(s7.chapters_w(), 287);
         assert!(s7.pin_chapters());
+        assert_eq!(s7.shelf(), "");
+        s3.set_shelf("content://tree/x");
+        assert_eq!(Store::load(Some(dir.clone())).shelf(), "content://tree/x");
+
+        // Name and page count for the library; old 5-column lines still load.
+        let mut s8 = Store::load(Some(dir.clone()));
+        s8.opened("content://a/b%20c", "B c.pdf", 12);
+        s8.opened("content://new", "New\tone.pdf", 3);
+        s8.save();
+        let s9 = Store::load(Some(dir.clone()));
+        let r = s9.recent();
+        assert_eq!((r[0].uri.as_str(), r[0].name.as_str(), r[0].pages), ("content://new", "New one.pdf", 3));
+        assert_eq!((r[1].name.as_str(), r[1].pages, r[1].pos), ("B c.pdf", 12, p));
+        assert_eq!(r[2].uri, "content://other");
+        std::fs::write(dir.join("positions.tsv"), "2\t0.5\t1.0\t0.0\tcontent://old\n").unwrap();
+        let s10 = Store::load(Some(dir.clone()));
+        assert_eq!((s10.recent()[0].name.as_str(), s10.recent()[0].pages, s10.recent()[0].pos.page), ("", 0, 2));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

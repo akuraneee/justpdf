@@ -4,9 +4,13 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
+mod shelf;
+use shelf::{Covers, Shelf};
+
 use crate::gesture::{Fling, VelocityTracker};
 use crate::gfx::{Gpu, Painter};
 use crate::layout::{self, Layout, View, MAX_ZOOM, MIN_ZOOM};
+use crate::library::Library;
 use crate::pdfium::OutlineItem;
 use crate::search;
 use crate::store::{Position, Store};
@@ -28,7 +32,18 @@ pub const ACTION_POINTER_UP: i32 = 6;
 
 /// Calls from the app into the host platform.
 pub trait Platform {
+    /// System document picker; answers with `Event::Open*` or `PickerCancelled`.
     fn open_picker(&mut self);
+    /// System folder picker; answers with `Event::FolderPicked` (nothing if cancelled).
+    fn open_folder_picker(&mut self);
+    /// Lists the PDFs under a library folder; answers with `Event::FolderScanned`.
+    fn scan_folder(&mut self, uri: &str);
+    /// The folder was removed from the library: give up access to it.
+    fn release_folder(&mut self, uri: &str);
+    /// Opens a document by URI; answers like the picker (`Event::Open` / `OpenFailed`).
+    fn open_document(&mut self, uri: &str);
+    /// Opens a document for its cover; answers with `Event::CoverFd`.
+    fn open_cover(&mut self, key: u64, uri: &str);
     fn show_keyboard(&mut self, mode: i32, text: &str);
     fn hide_keyboard(&mut self);
     fn system_bars(&mut self, visible: bool);
@@ -62,6 +77,22 @@ pub enum Event {
     },
     OpenFailed(String),
     PickerCancelled,
+    /// A folder was chosen to add to the library.
+    FolderPicked {
+        uri: String,
+        name: String,
+    },
+    /// Result of `Platform::scan_folder`: (folder path, file name, URI) per PDF.
+    FolderScanned {
+        uri: String,
+        books: Vec<(String, String, String)>,
+        ok: bool,
+    },
+    /// Result of `Platform::open_cover`: a read-only fd (owned), or negative.
+    CoverFd {
+        key: u64,
+        fd: i32,
+    },
     /// Text field contents from the IME; `cursor` is in UTF-16 units.
     Text {
         text: String,
@@ -93,6 +124,10 @@ enum Hit {
     Spread,
     Caffeine,
     Bar,
+    ShelfBack,
+    ShelfOpenFile,
+    ShelfAddFolder,
+    ShelfRemove,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -143,6 +178,20 @@ enum Gesture {
     PanelResize {
         w: f32,
         grab: f32,
+        moved: bool,
+    },
+    /// Library grid; `sx`, `sy`: where the touch began.
+    Shelf {
+        y: f32,
+        sx: f32,
+        sy: f32,
+        moved: bool,
+    },
+    /// Library tab strip (scrolls sideways); `start`: x where the touch began.
+    ShelfTabs {
+        x: f32,
+        start: f32,
+        y: f32,
         moved: bool,
     },
 }
@@ -221,6 +270,9 @@ pub struct App {
     now: f64,
     last_update: f64,
     store: Store,
+    library: Library,
+    shelf: Shelf,
+    covers: Covers,
     worker: Worker,
     next_id: u64,
     doc: Option<Doc>,
@@ -298,7 +350,10 @@ fn approach(v: &mut f32, target: f32, step: f32) -> bool {
 
 impl App {
     pub fn new(density: f32, files_dir: Option<PathBuf>, sink: Sink) -> App {
+        let covers = Covers::new(files_dir.as_ref().map(|d| d.join("covers")));
+        let library = Library::load(files_dir.clone());
         let store = Store::load(files_dir);
+        let shelf = Shelf::new(&library, store.shelf());
         let spread = store.spread();
         let caffeine = store.caffeine();
         let pin_chapters = store.pin_chapters();
@@ -313,6 +368,9 @@ impl App {
             now: 0.0,
             last_update: 0.0,
             store,
+            library,
+            shelf,
+            covers,
             worker: Worker::new(sink),
             next_id: 1,
             doc: None,
@@ -396,7 +454,12 @@ impl App {
 
     /// Whether a back press would be handled by the app (rather than exiting).
     pub fn back_consumable(&self) -> bool {
-        self.panel.open || self.mode != Mode::Read
+        self.panel.open || self.mode != Mode::Read || (self.shelf.open && self.doc.is_some())
+    }
+
+    /// The library screen is up: always without a document, or over one.
+    pub fn shelf_visible(&self) -> bool {
+        self.shelf.open || self.doc.is_none()
     }
 
     /// Something is moving: render continuously.
@@ -408,6 +471,8 @@ impl App {
             || self.indicator_t != self.indicator_target()
             || self.panel.t != if self.panel.open { 1.0 } else { 0.0 }
             || !self.uploads.is_empty()
+            || self.shelf.fling.is_some()
+            || (self.shelf_visible() && self.covers.uploading())
     }
 
     pub fn needs_redraw(&self) -> bool {
@@ -432,6 +497,9 @@ impl App {
         }
         if let Some(d) = self.search.debounce {
             add(d);
+        }
+        if let Some((_, since)) = &self.shelf.opening {
+            add(since + 0.3);
         }
         t
     }
@@ -510,7 +578,7 @@ impl App {
     }
 
     fn overlay_visible(&self) -> bool {
-        self.overlay || self.mode != Mode::Read || self.doc.is_none()
+        self.overlay || self.mode != Mode::Read || self.shelf_visible()
     }
 
     fn indicator_target(&self) -> f32 {
@@ -678,6 +746,7 @@ impl App {
 
     /// The window went away: keep only what is on screen.
     pub fn trim(&mut self, gpu: &mut dyn Gpu) {
+        self.covers.clear_gpu(gpu);
         let Some(l) = self.layout() else { return };
         let v = self.view;
         let range = l.range(v.y, v.y + self.vh as f64 / v.zoom);
@@ -688,6 +757,7 @@ impl App {
     /// The GL context was lost; every texture is gone.
     pub fn gpu_lost(&mut self) {
         self.tiles.forget();
+        self.covers.forget_gpu();
         self.text.forget_gpu();
         self.requests_dirty = true;
         self.dirty = true;
@@ -706,6 +776,7 @@ impl App {
         match ev {
             Event::Insets(i) => self.insets = i,
             Event::Touch { action, index, pointers, time } => self.touch(action, index, pointers, time, p),
+            Event::Wheel { delta, .. } if self.shelf_visible() => self.shelf_scroll_by(-(delta as f64) * self.dp(64.0) as f64),
             Event::Wheel { delta, .. } => {
                 let dy = -(delta as f64) * self.dp(64.0) as f64 / self.view.zoom;
                 self.anim = None;
@@ -714,6 +785,7 @@ impl App {
                 self.set_view(View { y: self.view.y + dy, ..self.view });
                 self.touch_activity();
             }
+            Event::Key(_) if self.shelf_visible() => {}
             Event::Key(code) => self.key(code),
             Event::Back => {
                 self.back(p);
@@ -730,16 +802,13 @@ impl App {
             }
             Event::OpenFailed(msg) => {
                 crate::log_w!("open failed: {msg}");
+                self.shelf.opening = None;
                 self.toast("Can't open this file");
-                if self.doc.is_none() && self.pending.is_none() {
-                    p.open_picker();
-                }
             }
-            Event::PickerCancelled => {
-                if self.doc.is_none() && self.pending.is_none() {
-                    p.exit();
-                }
-            }
+            Event::PickerCancelled => {}
+            Event::FolderPicked { uri, name } => self.folder_picked(&uri, &name, p),
+            Event::FolderScanned { uri, books, ok } => self.folder_scanned(&uri, books, ok),
+            Event::CoverFd { key, fd } => self.cover_fd(key, fd),
             Event::Text { text, cursor } => {
                 self.cursor = utf16_to_char_index(&text, cursor);
                 if text != self.field {
@@ -760,6 +829,11 @@ impl App {
             Msg::Opened { doc, sizes } => {
                 let Some(pending) = self.pending.take_if(|pd| pd.id == doc) else { return };
                 let restore = self.store.get(&pending.uri);
+                self.store.opened(&pending.uri, &pending.name, sizes.len() as u32);
+                self.opened_cover(doc, &pending.uri);
+                self.shelf.open = false;
+                self.shelf.opening = None;
+                self.shelf.stale = true;
                 self.doc = Some(Doc { id: doc, uri: pending.uri, name: pending.name, sizes, outline: Vec::new(), layout: None, restore });
                 self.clear_tiles = true;
                 self.sent.clear();
@@ -790,10 +864,8 @@ impl App {
             Msg::OpenFailed { doc, error } => {
                 if self.pending.take_if(|pd| pd.id == doc).is_some() {
                     crate::log_w!("cannot open: {error}");
+                    self.shelf.opening = None;
                     self.toast("Can't open this file");
-                    if self.doc.is_none() {
-                        p.open_picker();
-                    }
                 }
             }
             Msg::Outline { doc, items } => {
@@ -823,6 +895,8 @@ impl App {
                     }
                 }
             }
+            Msg::Cover { key, w, h, pixels } => self.cover_ready(key, w, h, pixels),
+            Msg::CoverFailed { key, missing } => self.cover_failed(key, missing),
         }
     }
 
@@ -855,6 +929,10 @@ impl App {
             self.set_mode(Mode::Read, p);
             return true;
         }
+        if self.shelf.open && self.doc.is_some() {
+            self.hide_shelf();
+            return true;
+        }
         false
     }
 
@@ -869,9 +947,7 @@ impl App {
         }
         if old == Mode::Password && mode != Mode::Password {
             self.pending = None;
-            if self.doc.is_none() {
-                p.open_picker();
-            }
+            self.shelf.opening = None;
         }
         self.mode = mode;
         self.panel.open = false;
@@ -1034,6 +1110,10 @@ impl App {
 
     fn touch(&mut self, action: i32, index: usize, pointers: Vec<(i32, f32, f32)>, time: f64, p: &mut dyn Platform) {
         self.pointers = pointers;
+        if self.shelf_visible() && self.mode != Mode::Password {
+            // The library works in window coordinates.
+            return self.shelf_touch(action, index, time, p);
+        }
         // Everything but the docked panel works in document-viewport coordinates.
         if self.ox != 0.0 {
             for p in &mut self.pointers {
@@ -1186,7 +1266,7 @@ impl App {
                 };
                 self.gesture = Gesture::PanelResize { w, grab, moved };
             }
-            Gesture::PanelOutside | Gesture::None => {}
+            Gesture::PanelOutside | Gesture::Shelf { .. } | Gesture::ShelfTabs { .. } | Gesture::None => {}
         }
     }
 
@@ -1259,7 +1339,7 @@ impl App {
                     self.update_dock(self.vh);
                 }
             }
-            Gesture::None => {}
+            Gesture::Shelf { .. } | Gesture::ShelfTabs { .. } | Gesture::None => {}
         }
     }
 
@@ -1285,7 +1365,8 @@ impl App {
     fn press(&mut self, hit: Hit, p: &mut dyn Platform) {
         self.overlay_until = self.now + OVERLAY_TIMEOUT;
         match hit {
-            Hit::Open => p.open_picker(),
+            Hit::Open => self.show_shelf(p),
+            Hit::ShelfBack | Hit::ShelfOpenFile | Hit::ShelfAddFolder | Hit::ShelfRemove => self.shelf_press(hit, p),
             Hit::Search => self.set_mode(Mode::Search, p),
             Hit::Chapters => {
                 if self.docked() {
@@ -1503,6 +1584,8 @@ impl App {
             }
         }
 
+        self.shelf_update(now, p);
+
         if self.caffeine_applied != Some(self.caffeine) {
             self.caffeine_applied = Some(self.caffeine);
             p.keep_screen_on(self.caffeine);
@@ -1573,8 +1656,17 @@ impl App {
     fn update_requests(&mut self) {
         self.requests_dirty = false;
         let Some(d) = &self.doc else { return };
-        let Some(l) = &d.layout else { return };
         let id = d.id;
+        if self.shelf_visible() {
+            // Nothing of the document is on screen.
+            self.wanted.clear();
+            if !self.sent.is_empty() {
+                self.worker.set_queue(id, Vec::new());
+                self.sent.clear();
+            }
+            return;
+        }
+        let Some(l) = &d.layout else { return };
         let (vw, vh) = (self.vw as f64, self.vh as f64);
         let v = self.view;
         let level = self.render_level;
@@ -1708,6 +1800,10 @@ impl App {
         if !self.uploads.is_empty() {
             self.dirty = true;
         }
+        if self.shelf_visible() {
+            return self.render_shelf(gpu);
+        }
+        self.covers.clear_gpu(gpu);
 
         gpu.begin(self.win_w as u32, self.vh as u32, ui::BG);
         let atlas = self.text.flush(gpu);
@@ -1858,7 +1954,7 @@ impl App {
             let right = vw - self.insets[2] - self.dp(4.0);
             match self.mode {
                 Mode::Read => {
-                    self.icon_button(p, Icon::Open, left, cy, Hit::Open, a);
+                    self.icon_button(p, Icon::Library, left, cy, Hit::Open, a);
                     let mut rx = right;
                     let has_outline = self.doc.as_ref().is_some_and(|d| !d.outline.is_empty());
                     if self.doc.is_some() {
@@ -1971,16 +2067,21 @@ impl App {
             }
         }
 
-        if let Some((msg, _)) = self.toast.clone() {
-            let px = self.dp(14.0);
-            let w = (self.text.measure(&msg, px) + self.dp(32.0)).min(vw - self.dp(32.0));
-            let h = self.dp(40.0);
-            let x = (vw - w) / 2.0;
-            let y = vh - self.insets[3] - self.dp(72.0) - h;
-            p.rect(x, y, w, h, [48, 48, 54, 245], h / 2.0);
-            let baseline = y + h / 2.0 + self.text.cap_height(px) / 2.0;
-            self.text.draw(p, &msg, x + self.dp(16.0), baseline, px, ui::FG, w - self.dp(32.0));
-        }
+        self.draw_toast(p, 0.0, vw);
+    }
+
+    /// The toast message, centred in the `w` wide area starting at `x0`.
+    fn draw_toast(&mut self, p: &mut Painter, x0: f32, w: f32) {
+        let Some((msg, _)) = &self.toast else { return };
+        let msg = msg.clone();
+        let px = self.dp(14.0);
+        let tw = (self.text.measure(&msg, px) + self.dp(32.0)).min(w - self.dp(32.0));
+        let h = self.dp(40.0);
+        let x = x0 + (w - tw) / 2.0;
+        let y = self.vh - self.insets[3] - self.dp(72.0) - h;
+        p.rect(x, y, tw, h, [48, 48, 54, 245], h / 2.0);
+        let baseline = y + h / 2.0 + self.text.cap_height(px) / 2.0;
+        self.text.draw(p, &msg, x + self.dp(16.0), baseline, px, ui::FG, tw - self.dp(32.0));
     }
 
     fn draw_panel(&mut self, p: &mut Painter) {

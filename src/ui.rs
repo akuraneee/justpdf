@@ -27,6 +27,12 @@ pub enum Icon {
     Spread,
     Caffeine,
     Pin,
+    /// A document with a folded corner.
+    File,
+    /// Books on a shelf.
+    Library,
+    /// Trash can.
+    Remove,
 }
 
 /// Draws `icon` centred at (`cx`, `cy`); `size` is the 24-unit design grid in px.
@@ -78,6 +84,31 @@ pub fn icon(p: &mut Painter, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgb
             let (a, b) = pt(12.0, 13.5);
             let (c, d) = pt(12.0, 20.5);
             p.line(a, b, c, d, t, color);
+        }
+        Icon::File => {
+            let pts = [(14.0, 3.0), (6.0, 3.0), (6.0, 21.0), (18.0, 21.0), (18.0, 7.0), (14.0, 3.0), (14.0, 7.0), (18.0, 7.0)];
+            p.polyline(&pts.map(|(x, y)| pt(x, y)), t, color);
+        }
+        Icon::Library => {
+            // Two upright books and a leaning one.
+            for x in [5.0, 9.5] {
+                let r = [(x, 4.0), (x + 3.0, 4.0), (x + 3.0, 20.0), (x, 20.0), (x, 4.0)];
+                p.polyline(&r.map(|(x, y)| pt(x, y)), t, color);
+            }
+            let lean = [(14.5, 6.5), (17.4, 5.7), (21.0, 19.2), (18.1, 20.0), (14.5, 6.5)];
+            p.polyline(&lean.map(|(x, y)| pt(x, y)), t, color);
+        }
+        Icon::Remove => {
+            let (a, b) = pt(4.0, 6.5);
+            let (c, d) = pt(20.0, 6.5);
+            p.line(a, b, c, d, t, color);
+            p.polyline(&[pt(9.5, 6.5), pt(9.5, 3.5), pt(14.5, 3.5), pt(14.5, 6.5)], t, color);
+            p.polyline(&[pt(6.5, 6.5), pt(7.5, 20.5), pt(16.5, 20.5), pt(17.5, 6.5)], t, color);
+            for x in [10.5, 13.5] {
+                let (a, b) = pt(x, 10.0);
+                let (c, d) = pt(x, 17.0);
+                p.line(a, b, c, d, 1.6 * k, color);
+            }
         }
         Icon::Back => {
             let (a, b) = pt(19.5, 12.0);

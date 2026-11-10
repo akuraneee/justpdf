@@ -2,7 +2,9 @@
 //!
 //! Architecture (see CLAUDE.md for the full picture):
 //! - `android`: JNI entry points + render thread (EGL, frame loop).
-//! - `app`: platform-independent state machine (input, view, tiles, UI).
+//! - `app`: platform-independent state machine (input, view, tiles, UI);
+//!   `app::shelf` is the library screen.
+//! - `library`/`covers`: library folders and the book cover cache.
 //! - `worker`: PDFium thread with a priority queue (tiles, search, outline).
 //! - `pdfium`: dlopen'ed PDFium bindings.
 //! - `gl`/`egl`: OpenGL ES 3 backend; `gfx`: backend-neutral drawing API.
@@ -10,9 +12,11 @@
 pub mod log;
 
 pub mod app;
+pub mod covers;
 pub mod gesture;
 pub mod gfx;
 pub mod layout;
+pub mod library;
 pub mod pdfium;
 pub mod search;
 pub mod store;
