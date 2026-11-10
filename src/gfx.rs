@@ -30,6 +30,8 @@ pub trait Gpu {
     /// texels from outside the valid area.
     fn draw_texture(&mut self, tex: TexId, rect: [f32; 4], uv: [f32; 4], clamp: [f32; 4]);
     fn draw_ui(&mut self, vertices: &[UiVertex], atlas: TexId);
+    /// Restricts drawing to screen rect `[x, y, w, h]` (`None`: the whole screen).
+    fn clip(&mut self, rect: Option<[f32; 4]>);
 }
 
 pub fn alpha(c: Rgba, a: f32) -> Rgba {
@@ -39,8 +41,9 @@ pub fn alpha(c: Rgba, a: f32) -> Rgba {
 #[derive(Default)]
 pub struct Painter {
     pub v: Vec<UiVertex>,
-    /// Added to every x coordinate (draws content-area shapes into window space).
+    /// Added to every x / y coordinate (draws content-area shapes into window space).
     pub ox: f32,
+    pub oy: f32,
 }
 
 impl Painter {
@@ -53,7 +56,7 @@ impl Painter {
             return;
         }
         for i in [0, 1, 2, 0, 2, 3] {
-            let pos = [corners[i][0] + self.ox, corners[i][1]];
+            let pos = [corners[i][0] + self.ox, corners[i][1] + self.oy];
             self.v.push(UiVertex { pos, uv: uvs[i], color, p });
         }
     }
@@ -153,4 +156,5 @@ impl Gpu for NullGpu {
     fn draw_ui(&mut self, v: &[UiVertex], _: TexId) {
         self.ui_vertices += v.len();
     }
+    fn clip(&mut self, _: Option<[f32; 4]>) {}
 }

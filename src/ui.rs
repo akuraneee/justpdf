@@ -15,6 +15,7 @@ pub const ROW_SEL: Rgba = [138, 180, 248, 30];
 pub const HIT: Rgba = [255, 210, 60, 100];
 pub const HIT_CURRENT: Rgba = [255, 120, 0, 140];
 pub const THUMB: Rgba = [255, 255, 255, 150];
+pub const DIVIDER: Rgba = [58, 58, 64, 255];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Icon {
@@ -24,7 +25,9 @@ pub enum Icon {
     Back,
     Up,
     Down,
-    Spread,
+    /// Split view: a window divided in two side by side (`SplitRows`: one above the other).
+    Split,
+    SplitRows,
     Caffeine,
     Pin,
     /// A document with a folded corner.
@@ -63,11 +66,20 @@ pub fn icon(p: &mut Painter, icon: Icon, cx: f32, cy: f32, size: f32, color: Rgb
                 p.line(a, b, c, d, t, color);
             }
         }
-        Icon::Spread => {
-            for x0 in [3.0, 13.0] {
-                let r = [(x0, 5.0), (x0 + 8.0, 5.0), (x0 + 8.0, 19.0), (x0, 19.0), (x0, 5.0)];
-                p.polyline(&r.map(|(x, y)| pt(x, y)), t, color);
-            }
+        Icon::Split => {
+            // A window divided in two halves.
+            let r = [(3.0, 5.0), (21.0, 5.0), (21.0, 19.0), (3.0, 19.0), (3.0, 5.0)];
+            p.polyline(&r.map(|(x, y)| pt(x, y)), t, color);
+            let (a, b) = pt(12.0, 5.0);
+            let (c, d) = pt(12.0, 19.0);
+            p.line(a, b, c, d, t, color);
+        }
+        Icon::SplitRows => {
+            let r = [(4.0, 3.0), (20.0, 3.0), (20.0, 21.0), (4.0, 21.0), (4.0, 3.0)];
+            p.polyline(&r.map(|(x, y)| pt(x, y)), t, color);
+            let (a, b) = pt(4.0, 12.0);
+            let (c, d) = pt(20.0, 12.0);
+            p.line(a, b, c, d, t, color);
         }
         Icon::Caffeine => {
             // Coffee cup with a handle and two wisps of steam.

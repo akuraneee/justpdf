@@ -214,7 +214,7 @@ fn run(vm: JavaVM, activity: GlobalRef, rx: Receiver<Cmd>, tx: Sender<Cmd>, shar
     }
     let mut platform = Jni { vm, activity };
     let sink_tx = Mutex::new(tx);
-    let sink = Box::new(move |m| {
+    let sink = Arc::new(move |m| {
         let _ = sink_tx.lock().unwrap_or_else(|e| e.into_inner()).send(Cmd::App(Event::Worker(m)));
     });
     let mut app = App::new(density, Some(files.into()), sink);

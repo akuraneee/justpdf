@@ -50,20 +50,17 @@ pub(super) struct Shelf {
     pub fling: Option<Fling>,
     tabs_scroll: f32,
     tabs_max: f32,
-    /// Tab chips as last drawn (window coordinates).
+    /// Tab chips as last drawn (pane coordinates).
     chips: Vec<[f32; 4]>,
     items: Vec<ShelfItem>,
     rows: Vec<Row>,
     height: f64,
     /// Contents must be rebuilt (store/library changed).
     pub stale: bool,
-    /// Window width and side insets the rows were built for.
+    /// Pane width and side insets the rows were built for.
     built: [f32; 3],
     /// A book being opened from the shelf: title, since.
     pub opening: Option<(String, f64)>,
-    /// Folders whose scan is running.
-    scanning: HashSet<String>,
-    last_scan: Option<f64>,
     /// "Remove folder" was tapped once; a second tap before this time removes it.
     remove_armed: Option<f64>,
 }
@@ -85,8 +82,6 @@ impl Shelf {
             stale: true,
             built: [0.0; 3],
             opening: None,
-            scanning: HashSet::new(),
-            last_scan: None,
             remove_armed: None,
         }
     }
@@ -229,7 +224,7 @@ impl App {
 
     /// Top of the tab strip.
     fn shelf_tabs_top(&self) -> f32 {
-        self.insets[1] + self.dp(56.0)
+        self.pane.insets[1] + self.dp(56.0)
     }
 
     /// Top of the scrolled grid.
@@ -238,16 +233,16 @@ impl App {
     }
 
     fn shelf_area(&self) -> f64 {
-        (self.vh - self.shelf_top()).max(1.0) as f64
+        (self.pane.vh - self.shelf_top()).max(1.0) as f64
     }
 
     fn shelf_max_scroll(&self) -> f64 {
-        (self.shelf.height + (self.insets[3] + self.dp(16.0)) as f64 - self.shelf_area()).max(0.0)
+        (self.pane.shelf.height + (self.pane.insets[3] + self.dp(16.0)) as f64 - self.shelf_area()).max(0.0)
     }
 
     fn shelf_grid(&self) -> Grid {
-        let left = self.insets[0] + self.dp(16.0);
-        let width = (self.win_w - self.insets[2] - self.dp(16.0) - left).max(self.dp(100.0));
+        let left = self.pane.insets[0] + self.dp(16.0);
+        let width = (self.pane.w - self.pane.insets[2] - self.dp(16.0) - left).max(self.dp(100.0));
         let gap = self.dp(12.0);
         let cols = (((width + gap) / (self.dp(104.0) + gap)) as usize).clamp(2, 12);
         let cell_w = (width - gap * (cols - 1) as f32) / cols as f32;
@@ -260,16 +255,16 @@ impl App {
     /// Rebuilds the items and rows of the current tab.
     fn shelf_build(&mut self) {
         let g = self.shelf_grid();
-        self.shelf.stale = false;
-        self.shelf.built = [self.win_w, self.insets[0], self.insets[2]];
-        if self.shelf.tab > self.library.folders.len() {
-            self.shelf.tab = 0;
+        self.pane.shelf.stale = false;
+        self.pane.shelf.built = [self.pane.w, self.pane.insets[0], self.pane.insets[2]];
+        if self.pane.shelf.tab > self.library.folders.len() {
+            self.pane.shelf.tab = 0;
         }
         let progress = |e: &crate::store::Entry| (e.pages > 0).then(|| ((e.pos.page + 1).min(e.pages), e.pages));
         let mut items = Vec::new();
         // (heading, item range) groups.
         let mut groups: Vec<(Option<String>, Range<usize>)> = Vec::new();
-        if self.shelf.tab == 0 {
+        if self.pane.shelf.tab == 0 {
             for e in self.store.recent() {
                 let name = if e.name.is_empty() { name_from_uri(&e.uri) } else { e.name.clone() };
                 let title = library::title(&name).to_string();
@@ -277,7 +272,7 @@ impl App {
             }
             groups.push((None, 0..items.len()));
         } else {
-            let f = &self.library.folders[self.shelf.tab - 1];
+            let f = &self.library.folders[self.pane.shelf.tab - 1];
             let known: HashMap<&str, (u32, u32)> =
                 self.store.recent().iter().filter_map(|e| Some((e.uri.as_str(), progress(e)?))).collect();
             let sections = library::sections(&f.books);
@@ -309,20 +304,20 @@ impl App {
                 i = end;
             }
         }
-        self.shelf.items = items;
-        self.shelf.rows = rows;
-        self.shelf.height = y;
-        self.shelf.scroll = self.shelf.scroll.clamp(0.0, self.shelf_max_scroll());
+        self.pane.shelf.items = items;
+        self.pane.shelf.rows = rows;
+        self.pane.shelf.height = y;
+        self.pane.shelf.scroll = self.pane.shelf.scroll.clamp(0.0, self.shelf_max_scroll());
         self.dirty = true;
     }
 
     fn shelf_item_at(&self, x: f32, y: f32) -> Option<usize> {
         let g = self.shelf_grid();
-        let cy = (y - self.shelf_top()) as f64 + self.shelf.scroll;
+        let cy = (y - self.shelf_top()) as f64 + self.pane.shelf.scroll;
         if y < self.shelf_top() {
             return None;
         }
-        let row = self.shelf.rows.iter().find(|r| cy >= r.y && cy < r.y + r.h)?;
+        let row = self.pane.shelf.rows.iter().find(|r| cy >= r.y && cy < r.y + r.h)?;
         let RowKind::Cells(range) = &row.kind else { return None };
         if cy > row.y + g.cell_h as f64 || x < g.left {
             return None;
@@ -338,36 +333,36 @@ impl App {
     /// Shows the library over the open document.
     pub(super) fn show_shelf(&mut self, p: &mut dyn Platform) {
         self.save_position();
-        if self.mode != Mode::Read {
+        if self.pane.mode != Mode::Read {
             self.set_mode(Mode::Read, p);
         }
-        self.panel.open = false;
-        self.shelf.open = true;
-        self.shelf.stale = true;
-        self.shelf.scroll = 0.0;
-        self.shelf.fling = None;
-        self.gesture = Gesture::None;
-        self.requests_dirty = true;
-        if self.shelf.last_scan.is_none_or(|t| self.now - t > RESCAN_AFTER) {
+        self.pane.panel.open = false;
+        self.pane.shelf.open = true;
+        self.pane.shelf.stale = true;
+        self.pane.shelf.scroll = 0.0;
+        self.pane.shelf.fling = None;
+        self.pane.gesture = Gesture::None;
+        self.pane.requests_dirty = true;
+        if self.last_scan.is_none_or(|t| self.now - t > RESCAN_AFTER) {
             self.scan_all(p);
         }
     }
 
     /// Back to the open document.
     pub(super) fn hide_shelf(&mut self) {
-        self.shelf.open = false;
-        self.shelf.fling = None;
-        self.shelf.remove_armed = None;
-        self.gesture = Gesture::None;
+        self.pane.shelf.open = false;
+        self.pane.shelf.fling = None;
+        self.pane.shelf.remove_armed = None;
+        self.pane.gesture = Gesture::None;
         self.invalidate();
-        self.overlay = true;
-        self.overlay_until = self.now + OVERLAY_TIMEOUT;
+        self.pane.overlay = true;
+        self.pane.overlay_until = self.now + OVERLAY_TIMEOUT;
     }
 
-    fn scan_all(&mut self, p: &mut dyn Platform) {
-        self.shelf.last_scan = Some(self.now);
+    pub(super) fn scan_all(&mut self, p: &mut dyn Platform) {
+        self.last_scan = Some(self.now);
         for f in &self.library.folders {
-            if self.shelf.scanning.insert(f.uri.clone()) {
+            if self.scanning.insert(f.uri.clone()) {
                 p.scan_folder(&f.uri);
             }
         }
@@ -378,45 +373,57 @@ impl App {
         if tab > self.library.folders.len() {
             return;
         }
-        if tab != self.shelf.tab {
-            self.shelf.tab = tab;
-            self.shelf.scroll = 0.0;
+        if tab != self.pane.shelf.tab {
+            self.pane.shelf.tab = tab;
+            self.pane.shelf.scroll = 0.0;
         }
-        self.shelf.fling = None;
-        self.shelf.stale = true;
-        self.shelf.remove_armed = None;
+        self.pane.shelf.fling = None;
+        self.pane.shelf.stale = true;
+        self.pane.shelf.remove_armed = None;
         let uri = if tab == 0 { String::new() } else { self.library.folders[tab - 1].uri.clone() };
         self.store.set_shelf(&uri);
     }
 
     fn open_book(&mut self, i: usize, p: &mut dyn Platform) {
-        let Some(item) = self.shelf.items.get(i) else { return };
-        if self.doc.as_ref().is_some_and(|d| d.uri == item.uri) {
+        let Some(item) = self.pane.shelf.items.get(i) else { return };
+        if self.pane.doc.as_ref().is_some_and(|d| d.uri == item.uri) {
             return self.hide_shelf();
         }
-        self.shelf.opening = Some((item.title.clone(), self.now));
+        self.pane.shelf.opening = Some((item.title.clone(), self.now));
         let uri = item.uri.clone();
-        p.open_document(&uri);
+        self.open_uri(&uri, p);
     }
 
     pub(super) fn shelf_press(&mut self, hit: Hit, p: &mut dyn Platform) {
         match hit {
+            // Without a document this is the library of a split view pane: close it.
+            Hit::ShelfBack if self.pane.doc.is_none() => self.close_pane(self.pane.id, p),
             Hit::ShelfBack => self.hide_shelf(),
-            Hit::ShelfOpenFile => p.open_picker(),
+            Hit::ShelfOpenFile => self.pick(p),
             Hit::ShelfAddFolder => p.open_folder_picker(),
             Hit::ShelfRemove => {
-                let Some(f) = self.shelf.tab.checked_sub(1).and_then(|i| self.library.folders.get(i)) else { return };
+                let Some(f) = self.pane.shelf.tab.checked_sub(1).and_then(|i| self.library.folders.get(i)) else { return };
                 let name = f.name.clone();
-                if self.shelf.remove_armed.is_some_and(|t| self.now < t) {
-                    if let Some(f) = self.library.remove(self.shelf.tab - 1) {
-                        self.shelf.scanning.remove(&f.uri);
+                if self.pane.shelf.remove_armed.is_some_and(|t| self.now < t) {
+                    let removed = self.pane.shelf.tab;
+                    if let Some(f) = self.library.remove(removed - 1) {
+                        self.scanning.remove(&f.uri);
                         p.release_folder(&f.uri);
                     }
+                    if let Some(o) = &mut self.other {
+                        // Keep the other pane on the same folder (or Recent if it was this one).
+                        o.shelf.tab = match o.shelf.tab {
+                            t if t == removed => 0,
+                            t if t > removed => t - 1,
+                            t => t,
+                        };
+                        o.shelf.stale = true;
+                    }
                     self.select_tab(0);
-                    self.shelf.tabs_scroll = 0.0;
+                    self.pane.shelf.tabs_scroll = 0.0;
                     self.toast(format!("“{name}” removed from the library"));
                 } else {
-                    self.shelf.remove_armed = Some(self.now + 3.0);
+                    self.pane.shelf.remove_armed = Some(self.now + 3.0);
                     self.toast(format!("Tap again to remove “{name}” (files stay)"));
                 }
             }
@@ -426,17 +433,23 @@ impl App {
 
     pub(super) fn folder_picked(&mut self, uri: &str, name: &str, p: &mut dyn Platform) {
         let i = self.library.add(uri, name);
+        if let Some(o) = &mut self.other {
+            o.shelf.stale = true;
+        }
         self.select_tab(i + 1);
-        if self.shelf.scanning.insert(uri.to_string()) {
+        if self.scanning.insert(uri.to_string()) {
             p.scan_folder(uri);
         }
-        if self.doc.is_some() && !self.shelf.open {
+        if self.pane.doc.is_some() && !self.pane.shelf.open {
             self.show_shelf(p);
         }
     }
 
     pub(super) fn folder_scanned(&mut self, uri: &str, books: Vec<(String, String, String)>, ok: bool) {
-        self.shelf.scanning.remove(uri);
+        self.scanning.remove(uri);
+        if let Some(o) = &mut self.other {
+            o.shelf.stale = true;
+        }
         if ok {
             let books = books.into_iter().map(|(dir, name, uri)| Book { uri, name, dir }).collect();
             self.library.set_books(uri, books);
@@ -444,12 +457,12 @@ impl App {
             let name = self.library.folders[i].name.clone();
             self.toast(format!("Can't read the folder “{name}”"));
         }
-        self.shelf.stale = true;
+        self.pane.shelf.stale = true;
     }
 
     pub(super) fn shelf_scroll_by(&mut self, dy: f64) {
-        self.shelf.fling = None;
-        self.shelf.scroll = (self.shelf.scroll + dy).clamp(0.0, self.shelf_max_scroll());
+        self.pane.shelf.fling = None;
+        self.pane.shelf.scroll = (self.pane.shelf.scroll + dy).clamp(0.0, self.shelf_max_scroll());
         self.dirty = true;
     }
 
@@ -460,14 +473,14 @@ impl App {
         let key = covers::key(uri);
         if let Some(dir) = &self.covers.dir {
             if !self.covers.disk.contains(&key) {
-                self.worker.cover(key, CoverSrc::Doc(doc), dir.clone());
+                self.pane.worker.cover(key, CoverSrc::Doc(doc), dir.clone());
             }
         }
     }
 
     pub(super) fn cover_fd(&mut self, key: u64, fd: i32) {
         match (&self.covers.dir, fd >= 0) {
-            (Some(dir), true) => self.worker.cover(key, CoverSrc::Fd(fd), dir.clone()),
+            (Some(dir), true) => self.pane.worker.cover(key, CoverSrc::Fd(fd), dir.clone()),
             (None, true) => unsafe {
                 libc::close(fd);
             },
@@ -476,11 +489,12 @@ impl App {
     }
 
     pub(super) fn cover_ready(&mut self, key: u64, w: u32, h: u32, pixels: Vec<u8>) {
+        let shown = self.any_shelf();
         let c = &mut self.covers;
         c.disk.insert(key);
         c.busy.remove(&key);
         match c.slots.get(&key) {
-            Some(Slot::Pending) if self.shelf.open || self.doc.is_none() => c.uploads.push_back((key, w, h, pixels)),
+            Some(Slot::Pending) if shown => c.uploads.push_back((key, w, h, pixels)),
             Some(Slot::Pending | Slot::Failed) => {
                 // Not shown now (or failed before but works now): ask again when needed.
                 c.slots.remove(&key);
@@ -512,16 +526,16 @@ impl App {
         if self.covers.busy.len() >= COVER_JOBS {
             return;
         }
-        let (s, area) = (self.shelf.scroll, self.shelf_area());
+        let (s, area) = (self.pane.shelf.scroll, self.shelf_area());
         let ranges = [(s, s + area), (s + area, s + area * 2.0), (s - area * 0.5, s)];
         for (y0, y1) in ranges {
-            let first = self.shelf.rows.partition_point(|r| r.y + r.h <= y0);
-            for r in &self.shelf.rows[first..] {
+            let first = self.pane.shelf.rows.partition_point(|r| r.y + r.h <= y0);
+            for r in &self.pane.shelf.rows[first..] {
                 if r.y >= y1 {
                     break;
                 }
                 let RowKind::Cells(range) = &r.kind else { continue };
-                for item in &self.shelf.items[range.clone()] {
+                for item in &self.pane.shelf.items[range.clone()] {
                     if self.covers.busy.len() >= COVER_JOBS {
                         return;
                     }
@@ -530,7 +544,7 @@ impl App {
                         continue;
                     }
                     if self.covers.disk.contains(&key) {
-                        self.worker.cover(key, CoverSrc::Disk, dir.clone());
+                        self.pane.worker.cover(key, CoverSrc::Disk, dir.clone());
                     } else {
                         p.open_cover(key, &item.uri);
                     }
@@ -544,25 +558,22 @@ impl App {
     // ----- per frame --------------------------------------------------------------------
 
     pub(super) fn shelf_update(&mut self, now: f64, p: &mut dyn Platform) {
-        if self.shelf.last_scan.is_none() {
-            self.scan_all(p);
-        }
-        if self.shelf.remove_armed.is_some_and(|t| now >= t) {
-            self.shelf.remove_armed = None;
+        if self.pane.shelf.remove_armed.is_some_and(|t| now >= t) {
+            self.pane.shelf.remove_armed = None;
         }
         if !self.shelf_visible() {
             return;
         }
-        if self.shelf.stale || self.shelf.built != [self.win_w, self.insets[0], self.insets[2]] {
+        if self.pane.shelf.stale || self.pane.shelf.built != [self.pane.w, self.pane.insets[0], self.pane.insets[2]] {
             self.shelf_build();
         }
-        if let Some(mut f) = self.shelf.fling.take() {
+        if let Some(mut f) = self.pane.shelf.fling.take() {
             let ((_, dy), running) = f.step(now);
             let max = self.shelf_max_scroll();
-            let s = self.shelf.scroll - dy;
-            self.shelf.scroll = s.clamp(0.0, max);
-            if running && s == self.shelf.scroll {
-                self.shelf.fling = Some(f);
+            let s = self.pane.shelf.scroll - dy;
+            self.pane.shelf.scroll = s.clamp(0.0, max);
+            if running && s == self.pane.shelf.scroll {
+                self.pane.shelf.fling = Some(f);
             }
             self.dirty = true;
         }
@@ -576,10 +587,10 @@ impl App {
         let slop = self.dp(8.0);
         match action {
             ACTION_DOWN => {
-                self.vel.reset();
-                self.vel.add(time, x as f64, y as f64);
-                let stopped = self.shelf.fling.take().is_some();
-                self.gesture = if let Some(b) = self.buttons.iter().rev().find(|b| inside(b.r, x, y)).copied() {
+                self.pane.vel.reset();
+                self.pane.vel.add(time, x as f64, y as f64);
+                let stopped = self.pane.shelf.fling.take().is_some();
+                self.pane.gesture = if let Some(b) = self.pane.buttons.iter().rev().find(|b| inside(b.r, x, y)).copied() {
                     Gesture::Button { hit: b.hit, r: b.r, inside: true }
                 } else if y >= self.shelf_top() {
                     // Touching a moving grid only stops it.
@@ -592,32 +603,32 @@ impl App {
             }
             ACTION_MOVE => {
                 let Some(&(_, cx, cy)) = self.pointers.first() else { return };
-                match self.gesture {
-                    Gesture::Button { hit, r, .. } => self.gesture = Gesture::Button { hit, r, inside: inside(r, cx, cy) },
+                match self.pane.gesture {
+                    Gesture::Button { hit, r, .. } => self.pane.gesture = Gesture::Button { hit, r, inside: inside(r, cx, cy) },
                     Gesture::Shelf { y, sx, sy, moved } => {
-                        self.vel.add(time, cx as f64, cy as f64);
+                        self.pane.vel.add(time, cx as f64, cy as f64);
                         let moved = moved || (cy - sy).abs() > slop || (cx - sx).abs() > slop;
                         if moved {
                             self.shelf_scroll_by(-(cy - y) as f64);
                         }
-                        self.gesture = Gesture::Shelf { y: cy, sx, sy, moved };
+                        self.pane.gesture = Gesture::Shelf { y: cy, sx, sy, moved };
                     }
                     Gesture::ShelfTabs { x, start, y, moved } => {
                         let moved = moved || (cx - start).abs() > slop;
                         if moved {
-                            self.shelf.tabs_scroll = (self.shelf.tabs_scroll - (cx - x)).clamp(0.0, self.shelf.tabs_max);
+                            self.pane.shelf.tabs_scroll = (self.pane.shelf.tabs_scroll - (cx - x)).clamp(0.0, self.pane.shelf.tabs_max);
                         }
-                        self.gesture = Gesture::ShelfTabs { x: cx, start, y, moved };
+                        self.pane.gesture = Gesture::ShelfTabs { x: cx, start, y, moved };
                     }
                     _ => {}
                 }
                 self.dirty = true;
             }
-            ACTION_UP => match std::mem::replace(&mut self.gesture, Gesture::None) {
+            ACTION_UP => match std::mem::replace(&mut self.pane.gesture, Gesture::None) {
                 Gesture::Button { hit, r, .. } if inside(r, x, y) => self.press(hit, p),
                 Gesture::Shelf { moved: true, .. } => {
-                    let (_, vy) = self.vel.velocity(time);
-                    self.shelf.fling = Fling::new(self.now, 0.0, vy, self.density as f64);
+                    let (_, vy) = self.pane.vel.velocity(time);
+                    self.pane.shelf.fling = Fling::new(self.now, 0.0, vy, self.density as f64);
                 }
                 Gesture::Shelf { sx, sy, moved: false, .. } => {
                     if let Some(i) = self.shelf_item_at(sx, sy) {
@@ -625,13 +636,13 @@ impl App {
                     }
                 }
                 Gesture::ShelfTabs { start, y, moved: false, .. } => {
-                    if let Some(i) = self.shelf.chips.iter().position(|&r| inside(r, start, y)) {
+                    if let Some(i) = self.pane.shelf.chips.iter().position(|&r| inside(r, start, y)) {
                         self.select_tab(i);
                     }
                 }
                 _ => {}
             },
-            ACTION_CANCEL => self.gesture = Gesture::None,
+            ACTION_CANCEL => self.pane.gesture = Gesture::None,
             _ => {}
         }
     }
@@ -639,29 +650,29 @@ impl App {
     // ----- drawing ----------------------------------------------------------------------
 
     pub(super) fn render_shelf(&mut self, gpu: &mut dyn Gpu) {
-        if self.shelf.stale || self.shelf.built != [self.win_w, self.insets[0], self.insets[2]] {
+        if self.pane.shelf.stale || self.pane.shelf.built != [self.pane.w, self.pane.insets[0], self.pane.insets[2]] {
             self.shelf_build();
         }
         let frame = self.frame;
         if self.covers.upload(gpu, frame) {
             self.dirty = true;
         }
-        gpu.begin(self.win_w as u32, self.vh as u32, ui::BG);
-        let mut under = Painter::default();
-        let mut over = Painter::default();
+        let (x0, y0) = (self.pane.x0, self.pane.y0);
+        let mut under = Painter { ox: x0, oy: y0, ..Default::default() };
+        let mut over = Painter { ox: x0, oy: y0, ..Default::default() };
         let mut draws: Vec<(TexId, [f32; 4], [f32; 4])> = Vec::new();
-        self.buttons.clear();
+        self.pane.buttons.clear();
 
         let g = self.shelf_grid();
         let top = self.shelf_top();
-        let vh = self.vh;
-        let scroll = self.shelf.scroll;
-        let pressed = match self.gesture {
+        let vh = self.pane.vh;
+        let scroll = self.pane.shelf.scroll;
+        let pressed = match self.pane.gesture {
             Gesture::Shelf { sx, sy, moved: false, .. } => self.shelf_item_at(sx, sy),
             _ => None,
         };
-        let rows = std::mem::take(&mut self.shelf.rows);
-        let items = std::mem::take(&mut self.shelf.items);
+        let rows = std::mem::take(&mut self.pane.shelf.rows);
+        let items = std::mem::take(&mut self.pane.shelf.items);
         let (tpx, spx, hpx, lpx) = (self.dp(13.0), self.dp(11.5), self.dp(15.0), self.dp(30.0));
         let (pad, bar_h, radius) = (self.dp(8.0), self.dp(3.0), self.dp(6.0));
         let first = rows.partition_point(|r| r.y + r.h <= scroll);
@@ -675,7 +686,7 @@ impl App {
                     let base = y + row.h as f32 / 2.0 + self.dp(4.0);
                     let n = format!("{count}");
                     let nw = self.text.measure(&n, tpx);
-                    let right = self.win_w - self.insets[2] - self.dp(16.0);
+                    let right = self.pane.w - self.pane.insets[2] - self.dp(16.0);
                     self.text.draw(&mut over, &n, right - nw, base + self.text.cap_height(tpx) / 2.0, tpx, ui::DIM, nw + 1.0);
                     let max = (right - nw - self.dp(12.0) - g.left).max(0.0);
                     self.text.draw(&mut over, title, g.left, base + self.text.cap_height(hpx) / 2.0, hpx, ui::ACCENT, max);
@@ -727,8 +738,8 @@ impl App {
             }
         }
         let empty = items.is_empty();
-        self.shelf.rows = rows;
-        self.shelf.items = items;
+        self.pane.shelf.rows = rows;
+        self.pane.shelf.items = items;
         if empty {
             self.draw_shelf_empty(&mut over);
         }
@@ -736,65 +747,65 @@ impl App {
 
         if let Some(msg) = self.shelf_opening_label() {
             let px = self.dp(14.0);
-            let w = (self.text.measure(&msg, px) + self.dp(32.0)).min(self.win_w - self.dp(32.0));
+            let w = (self.text.measure(&msg, px) + self.dp(32.0)).min(self.pane.w - self.dp(32.0));
             let h = self.dp(40.0);
-            let (x, y) = ((self.win_w - w) / 2.0, vh - self.insets[3] - self.dp(24.0) - h);
+            let (x, y) = ((self.pane.w - w) / 2.0, vh - self.pane.insets[3] - self.dp(24.0) - h);
             over.rect(x, y, w, h, [48, 48, 54, 245], h / 2.0);
             let baseline = y + h / 2.0 + self.text.cap_height(px) / 2.0;
             self.text.draw(&mut over, &msg, x + self.dp(16.0), baseline, px, ui::FG, w - self.dp(32.0));
         }
-        if self.mode == Mode::Password {
+        if self.pane.mode == Mode::Password {
             // The password prompt for a book opened from here.
-            over.ox = self.ox;
+            over.ox = x0 + self.pane.ox;
             self.draw_overlay(&mut over);
         } else {
-            if self.menu {
+            if self.pane.menu {
                 self.draw_menu(&mut over);
             }
-            self.draw_toast(&mut over, 0.0, self.win_w);
+            self.draw_toast(&mut over, 0.0, self.pane.w);
         }
 
         let atlas = self.text.flush(gpu);
         gpu.draw_ui(&under.v, atlas);
         for (tex, r, clamp) in &draws {
-            gpu.draw_texture(*tex, *r, [0.0, 0.0, 1.0, 1.0], *clamp);
+            gpu.draw_texture(*tex, [r[0] + x0, r[1] + y0, r[2], r[3]], [0.0, 0.0, 1.0, 1.0], *clamp);
         }
         gpu.draw_ui(&over.v, atlas);
         self.covers.evict(gpu, frame);
     }
 
     fn shelf_opening_label(&self) -> Option<String> {
-        let (name, since) = match (&self.pending, &self.shelf.opening) {
+        let (name, since) = match (&self.pane.pending, &self.pane.shelf.opening) {
             (Some(pd), _) => (library::title(&pd.name).to_string(), pd.since),
             (None, Some((name, since))) => (name.clone(), *since),
             _ => return None,
         };
-        (self.now - since > 0.3 && self.mode != Mode::Password).then(|| format!("Opening {name}…"))
+        (self.now - since > 0.3 && self.pane.mode != Mode::Password).then(|| format!("Opening {name}…"))
     }
 
     fn draw_shelf_header(&mut self, p: &mut Painter) {
-        let w = self.win_w;
+        let w = self.pane.w;
         let top = self.shelf_top();
         p.rect(0.0, 0.0, w, top, ui::BAR, 0.0);
         p.rect(0.0, top - 1.0, w, 1.0, [255, 255, 255, 18], 0.0);
         let b = self.dp(48.0);
-        let cy = self.insets[1] + self.dp(28.0);
-        let left = self.insets[0] + self.dp(4.0);
-        let mut tx = self.insets[0] + self.dp(20.0);
-        if self.doc.is_some() {
+        let cy = self.pane.insets[1] + self.dp(28.0);
+        let left = self.pane.insets[0] + self.dp(4.0);
+        let mut tx = self.pane.insets[0] + self.dp(20.0);
+        if self.pane.doc.is_some() || self.split() {
             self.icon_button(p, Icon::Back, left, cy, Hit::ShelfBack, 1.0);
             tx = left + b + self.dp(8.0);
         }
-        let mut rx = w - self.insets[2] - self.dp(4.0);
+        let mut rx = w - self.pane.insets[2] - self.dp(4.0);
         rx -= b;
         self.icon_button(p, Icon::Settings, rx, cy, Hit::Settings, 1.0);
         rx -= b;
         self.icon_button(p, Icon::Open, rx, cy, Hit::ShelfAddFolder, 1.0);
         rx -= b;
         self.icon_button(p, Icon::File, rx, cy, Hit::ShelfOpenFile, 1.0);
-        if self.shelf.tab > 0 {
+        if self.pane.shelf.tab > 0 {
             rx -= b;
-            let armed = self.shelf.remove_armed.is_some();
+            let armed = self.pane.shelf.remove_armed.is_some();
             self.icon_button(p, Icon::Remove, rx, cy, Hit::ShelfRemove, 1.0);
             if armed {
                 p.ring(rx + b / 2.0, cy, b / 2.0 - self.dp(4.0), self.dp(2.0), ui::HIT_CURRENT);
@@ -807,41 +818,41 @@ impl App {
         let tpx = self.dp(14.0);
         let (h, gap, padx) = (self.dp(34.0), self.dp(8.0), self.dp(14.0));
         let y = self.shelf_tabs_top() + (self.dp(52.0) - h) / 2.0 - self.dp(2.0);
-        let x0 = self.insets[0] + self.dp(16.0);
-        let mut x = x0 - self.shelf.tabs_scroll;
+        let x0 = self.pane.insets[0] + self.dp(16.0);
+        let mut x = x0 - self.pane.shelf.tabs_scroll;
         let mut labels = vec![String::from("Recent")];
         labels.extend(self.library.folders.iter().map(|f| {
-            if self.shelf.scanning.contains(&f.uri) {
+            if self.scanning.contains(&f.uri) {
                 format!("{} …", f.name)
             } else {
                 f.name.clone()
             }
         }));
-        self.shelf.chips.clear();
+        self.pane.shelf.chips.clear();
         let max_label = (w * 0.6).max(self.dp(80.0));
         for (i, label) in labels.iter().enumerate() {
             let lw = self.text.measure(label, tpx).min(max_label);
             let cw = lw + 2.0 * padx;
-            let sel = i == self.shelf.tab;
+            let sel = i == self.pane.shelf.tab;
             p.rect(x, y, cw, h, if sel { ui::ACCENT } else { ui::FIELD }, h / 2.0);
             let color = if sel { [16, 24, 40, 255] } else { ui::FG };
             self.text.draw(p, label, x + padx, y + h / 2.0 + self.text.cap_height(tpx) / 2.0, tpx, color, lw + 1.0);
-            self.shelf.chips.push([x, y, cw, h]);
+            self.pane.shelf.chips.push([x, y, cw, h]);
             x += cw + gap;
         }
-        let total = x + self.shelf.tabs_scroll - gap - x0;
-        let visible = w - self.insets[2] - self.dp(16.0) - x0;
-        self.shelf.tabs_max = (total - visible).max(0.0);
-        self.shelf.tabs_scroll = self.shelf.tabs_scroll.min(self.shelf.tabs_max);
+        let total = x + self.pane.shelf.tabs_scroll - gap - x0;
+        let visible = w - self.pane.insets[2] - self.dp(16.0) - x0;
+        self.pane.shelf.tabs_max = (total - visible).max(0.0);
+        self.pane.shelf.tabs_scroll = self.pane.shelf.tabs_scroll.min(self.pane.shelf.tabs_max);
     }
 
     fn draw_shelf_empty(&mut self, p: &mut Painter) {
-        let w = self.win_w;
-        let cy = self.shelf_top() + (self.shelf_area() as f32 - self.insets[3]) * 0.4;
-        let folder = self.shelf.tab.checked_sub(1).and_then(|i| self.library.folders.get(i));
+        let w = self.pane.w;
+        let cy = self.shelf_top() + (self.shelf_area() as f32 - self.pane.insets[3]) * 0.4;
+        let folder = self.pane.shelf.tab.checked_sub(1).and_then(|i| self.library.folders.get(i));
         let nothing = self.store.recent().is_empty() && self.library.folders.is_empty();
         let (title, sub) = match folder {
-            Some(f) if self.shelf.scanning.contains(&f.uri) => ("Looking for PDF files…", ""),
+            Some(f) if self.scanning.contains(&f.uri) => ("Looking for PDF files…", ""),
             Some(_) => ("No PDF files in this folder", ""),
             None if nothing => ("Your library is empty", "Open a PDF, or add the folder with your books"),
             None => ("No recently opened books", ""),
@@ -860,11 +871,11 @@ impl App {
         for (label, hit) in [("Open a file", Hit::ShelfOpenFile), ("Add a folder", Hit::ShelfAddFolder)] {
             let bw = (self.text.measure(label, spx) + self.dp(56.0)).max(self.dp(200.0));
             let r = [(w - bw) / 2.0, y, bw, bh];
-            let down = matches!(self.gesture, Gesture::Button { hit: h, inside: true, .. } if h == hit);
+            let down = matches!(self.pane.gesture, Gesture::Button { hit: h, inside: true, .. } if h == hit);
             p.rect(r[0], r[1], bw, bh, if down { [255, 255, 255, 50] } else { ui::FIELD }, bh / 2.0);
             let lw = self.text.measure(label, spx);
             self.text.draw(p, label, (w - lw) / 2.0, y + bh / 2.0 + self.text.cap_height(spx) / 2.0, spx, ui::ACCENT, lw + 1.0);
-            self.buttons.push(Button { r, hit });
+            self.pane.buttons.push(Button { r, hit });
             y += bh + self.dp(12.0);
         }
     }
