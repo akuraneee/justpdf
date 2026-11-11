@@ -137,7 +137,7 @@ struct Shared {
     cv: Condvar,
 }
 
-pub type Sink = Box<dyn Fn(Msg) + Send>;
+pub type Sink = Arc<dyn Fn(Msg) + Send + Sync>;
 
 pub struct Worker {
     shared: Arc<Shared>,

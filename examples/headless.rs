@@ -210,7 +210,7 @@ fn main() {
     let gpu = GlGpu::new().expect("GL");
     let (tx, rx) = mpsc::channel();
     let sink_tx = std::sync::Mutex::new(tx.clone());
-    let sink = Box::new(move |m| {
+    let sink = std::sync::Arc::new(move |m| {
         let _ = sink_tx.lock().unwrap().send(Event::Worker(m));
     });
     let library = std::path::Path::new(pdf).is_dir();

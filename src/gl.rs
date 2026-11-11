@@ -16,6 +16,7 @@ const GL_COLOR_BUFFER_BIT: u32 = 0x4000;
 const GL_TRIANGLES: GLenum = 0x0004;
 const GL_TRIANGLE_STRIP: GLenum = 0x0005;
 const GL_BLEND: GLenum = 0x0BE2;
+const GL_SCISSOR_TEST: GLenum = 0x0C11;
 const GL_DITHER: GLenum = 0x0BD0;
 const GL_DEPTH_TEST: GLenum = 0x0B71;
 const GL_CULL_FACE: GLenum = 0x0B44;
@@ -50,6 +51,7 @@ const GL_MAX_TEXTURE_SIZE: GLenum = 0x0D33;
 #[cfg_attr(not(target_os = "android"), link(name = "GLESv2"))]
 extern "C" {
     fn glViewport(x: GLint, y: GLint, w: GLsizei, h: GLsizei);
+    fn glScissor(x: GLint, y: GLint, w: GLsizei, h: GLsizei);
     fn glClearColor(r: f32, g: f32, b: f32, a: f32);
     fn glClear(mask: u32);
     fn glEnable(cap: GLenum);
@@ -341,6 +343,7 @@ impl Gpu for GlGpu {
         self.current = 0;
         unsafe {
             glViewport(0, 0, self.width as GLsizei, self.height as GLsizei);
+            glDisable(GL_SCISSOR_TEST);
             glClearColor(c[0], c[1], c[2], c[3]);
             glClear(GL_COLOR_BUFFER_BIT);
             glUseProgram(self.tile_prog);
@@ -403,6 +406,21 @@ impl Gpu for GlGpu {
             glUniform4f(self.tile_clamp, c[0], c[1], c[2], c[3]);
             glBindTexture(GL_TEXTURE_2D, tex);
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        }
+    }
+
+    fn clip(&mut self, r: Option<[f32; 4]>) {
+        unsafe {
+            match r {
+                Some([x, y, w, h]) => {
+                    // GL counts rows from the bottom.
+                    let (x0, x1) = (x.round() as GLint, (x + w).round() as GLint);
+                    let (y0, y1) = (y.round() as GLint, (y + h).round() as GLint);
+                    glEnable(GL_SCISSOR_TEST);
+                    glScissor(x0, self.height as GLint - y1, (x1 - x0).max(0), (y1 - y0).max(0));
+                }
+                None => glDisable(GL_SCISSOR_TEST),
+            }
         }
     }
 
